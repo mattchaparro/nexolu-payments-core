@@ -17,7 +17,7 @@ async def lifespan(app: FastAPI):
     configure_logging(settings.log_level)
 
     # Autocrear tablas solo tiene sentido en SQLite de desarrollo. En
-    # produccion (Postgres) el esquema se maneja con `alembic upgrade head`,
+    # produccion (MySQL) el esquema se maneja con `alembic upgrade head`,
     # corrido como parte del despliegue, no al arrancar el proceso.
     if settings.database_url.startswith("sqlite"):
         await init_models()

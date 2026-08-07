@@ -1,8 +1,10 @@
 """Motor y sesiones de base de datos, async de punta a punta.
 
 `DATABASE_URL` decide el motor: SQLite (`sqlite+aiosqlite:///...`) para
-desarrollo local sin infraestructura, Postgres (`postgresql+asyncpg://...`)
-recomendado en produccion. Cambiar de motor es cambiar una env var, no codigo.
+desarrollo local sin infraestructura, MySQL (`mysql+aiomysql://...`) en
+produccion -- mismo motor que el resto del ecosistema Nexolu (nexolu-pos-api,
+nexolu-comms-api), para no operar dos motores de base de datos distintos.
+Cambiar de motor es cambiar una env var, no codigo.
 """
 from __future__ import annotations
 
@@ -43,7 +45,7 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 async def init_models() -> None:
     """Crea las tablas si no existen. Util para desarrollo local y tests con
-    SQLite; en produccion con Postgres el esquema se maneja con Alembic
+    SQLite; en produccion con MySQL el esquema se maneja con Alembic
     (ver alembic/)."""
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
