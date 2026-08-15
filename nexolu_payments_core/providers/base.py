@@ -19,7 +19,7 @@ APP_INTEGRATION.md, seccion "Direct API"):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 
 @dataclass(frozen=True)
@@ -82,6 +82,89 @@ class CardPaymentMethod:
 
     token: str
     installments: int = 1
+    type: Literal["CARD"] = "CARD"
+
+
+@dataclass(frozen=True)
+class NequiPaymentMethod:
+    """Cobro via Nequi: el usuario confirma con un push notification en su
+    app, no hay redirect. Solo hace falta su celular (10 digitos, Colombia)."""
+
+    phone_number: str
+    type: Literal["NEQUI"] = "NEQUI"
+
+
+@dataclass(frozen=True)
+class PsePaymentMethod:
+    """Cobro via PSE: el usuario termina el pago en el sitio de su banco.
+    `financial_institution_code` sale de `list_pse_financial_institutions`.
+    Asincrono -- ver `ChargeResult.redirect_url`."""
+
+    user_type: int  # 0 = persona natural, 1 = persona juridica (segun Wompi)
+    user_legal_id_type: str
+    user_legal_id: str
+    financial_institution_code: str
+    payment_description: str
+    customer_full_name: str
+    customer_phone_number: str
+    type: Literal["PSE"] = "PSE"
+
+
+@dataclass(frozen=True)
+class BancolombiaTransferPaymentMethod:
+    """Cobro via Boton de Transferencia Bancolombia: el usuario termina el
+    pago en el sitio de Bancolombia. Asincrono -- ver
+    `ChargeResult.redirect_url`."""
+
+    payment_description: str
+    ecommerce_url: str
+    type: Literal["BANCOLOMBIA_TRANSFER"] = "BANCOLOMBIA_TRANSFER"
+
+
+@dataclass(frozen=True)
+class PaymentSourceChargeMethod:
+    """Cobro reusando una Fuente de Pago (tarjeta o Nequi) ya tokenizada
+    antes con `create_payment_source` -- a diferencia de los demas metodos,
+    esto NO requiere que el usuario intervenga de nuevo (ni token nuevo, ni
+    push notification): es lo que hace posible un cobro genuinamente
+    recurrente. `installments` solo aplica si la fuente es una tarjeta,
+    Wompi lo ignora si es Nequi."""
+
+    payment_source_id: str
+    installments: int = 1
+    type: Literal["PAYMENT_SOURCE"] = "PAYMENT_SOURCE"
+
+
+PaymentMethodInput = (
+    CardPaymentMethod
+    | NequiPaymentMethod
+    | PsePaymentMethod
+    | BancolombiaTransferPaymentMethod
+    | PaymentSourceChargeMethod
+)
+
+
+@dataclass(frozen=True)
+class FinancialInstitution:
+    """Un banco disponible para pagar por PSE (ver
+    `list_pse_financial_institutions`). `code` es lo que hay que reenviar en
+    `PsePaymentMethod.financial_institution_code`."""
+
+    code: str
+    name: str
+
+
+@dataclass(frozen=True)
+class PaymentSource:
+    """Una Fuente de Pago creada en Wompi (tarjeta o Nequi ya tokenizada
+    para reuso, ver `create_payment_source`). `id` es lo que hay que
+    reenviar en `PaymentSourceChargeMethod.payment_source_id`. `status`
+    `"AVAILABLE"` significa lista para cobrar; `"VOIDED"` que ya se
+    cancelo (ver `void_payment_source`)."""
+
+    id: str
+    type: str
+    status: str
 
 
 @dataclass(frozen=True)
@@ -91,11 +174,18 @@ class ChargeResult:
     transaccion -- eso lo sigue siendo el webhook del proveedor
     (`ProviderEvent`, ver `handle_provider_webhook`). Sirve para que el Core
     tenga de una vez el id de transaccion del proveedor y la app pueda
-    mostrarle algo al usuario mientras espera la confirmacion async."""
+    mostrarle algo al usuario mientras espera la confirmacion async.
+
+    `redirect_url`: solo poblado para metodos asincronos que requieren que
+    el usuario termine el pago en el sitio de un tercero (PSE, Boton
+    Bancolombia) -- `None` para CARD/NEQUI. Si el proveedor no lo entrego a
+    tiempo (ver `WompiProvider.charge`), tambien queda en `None`; el
+    consumidor debe seguir esperando el webhook en ese caso."""
 
     provider_transaction_id: str
     raw_status: str
     raw: dict[str, Any]
+    redirect_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -154,8 +244,27 @@ class PaymentProvider(Protocol):
         currency: str,
         customer_email: str,
         credentials: ProviderCredentialsData,
-        payment_method: CardPaymentMethod,
+        payment_method: PaymentMethodInput,
     ) -> ChargeResult: ...
+
+    async def list_payment_methods(self, *, credentials: ProviderCredentialsData) -> list[str]: ...
+
+    async def list_pse_financial_institutions(
+        self, *, credentials: ProviderCredentialsData
+    ) -> list[FinancialInstitution]: ...
+
+    async def create_payment_source(
+        self,
+        *,
+        credentials: ProviderCredentialsData,
+        source_type: Literal["CARD", "NEQUI"],
+        token: str,
+        customer_email: str,
+    ) -> PaymentSource: ...
+
+    async def void_payment_source(
+        self, *, credentials: ProviderCredentialsData, payment_source_id: str
+    ) -> PaymentSource: ...
 
     def verify_webhook_signature(self, payload: dict[str, Any], credentials: ProviderCredentialsData) -> bool: ...
 

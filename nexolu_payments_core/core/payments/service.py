@@ -20,7 +20,7 @@ Dos formas de completar un pago conviven (ver docs/APP_INTEGRATION.md):
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,8 +29,10 @@ from nexolu_payments_core.core.memory.entities import Integration, ProviderCrede
 from nexolu_payments_core.core.payments.fees import calculate_fee_cop
 from nexolu_payments_core.core.webhooks.dispatcher import dispatch_transaction_event
 from nexolu_payments_core.providers.base import (
-    CardPaymentMethod,
     ChargeResult,
+    FinancialInstitution,
+    PaymentMethodInput,
+    PaymentSource,
     ProviderCredentialsData,
     ProviderRequestError,
 )
@@ -154,7 +156,7 @@ async def charge_payment_intent(
     *,
     integration: Integration,
     reference: str,
-    payment_method: CardPaymentMethod,
+    payment_method: PaymentMethodInput,
     provider_slug: str = "wompi",
 ) -> tuple[Transaction, ChargeResult]:
     """API directa: le pide al proveedor que intente cobrar una tarjeta ya
@@ -198,6 +200,88 @@ async def charge_payment_intent(
     await session.commit()
 
     return transaction, result
+
+
+async def get_available_payment_methods(
+    session: AsyncSession, *, integration: Integration, provider_slug: str = "wompi"
+) -> list[str]:
+    """Metodos de pago que el proveedor tiene habilitados para esta
+    integracion (ya filtrados a lo que este Core sabe orquestar -- ver
+    `_SUPPORTED_PAYMENT_METHODS` en `providers/wompi.py`). Pensado para que
+    el consumidor arme su selector de metodo de pago ANTES de crear un
+    intent, no en cada cobro."""
+    credential = await repository.get_active_credential(session, integration.id, provider_slug)
+    if credential is None:
+        raise IntegrationNotConfigured(
+            f"La integracion '{integration.slug}' no tiene credenciales activas de '{provider_slug}'."
+        )
+
+    provider = get_provider(provider_slug)
+    return await provider.list_payment_methods(credentials=_credentials_data(credential))
+
+
+async def get_pse_financial_institutions(
+    session: AsyncSession, *, integration: Integration, provider_slug: str = "wompi"
+) -> list[FinancialInstitution]:
+    """Bancos disponibles para pagar por PSE, proxeados desde el proveedor."""
+    credential = await repository.get_active_credential(session, integration.id, provider_slug)
+    if credential is None:
+        raise IntegrationNotConfigured(
+            f"La integracion '{integration.slug}' no tiene credenciales activas de '{provider_slug}'."
+        )
+
+    provider = get_provider(provider_slug)
+    return await provider.list_pse_financial_institutions(credentials=_credentials_data(credential))
+
+
+async def create_payment_source(
+    session: AsyncSession,
+    *,
+    integration: Integration,
+    source_type: Literal["CARD", "NEQUI"],
+    token: str,
+    customer_email: str,
+    provider_slug: str = "wompi",
+) -> PaymentSource:
+    """Tokeniza una tarjeta o cuenta Nequi PARA REUSO (a diferencia de
+    `charge_payment_intent`, que cobra una sola vez) -- ver
+    `providers/base.py` y `WompiProvider.create_payment_source`. El Core NO
+    persiste el `payment_source_id` resultante: lo crea y lo devuelve: quien
+    decide guardarlo contra un negocio/cliente es el consumidor (el Core no
+    conoce esa semantica de negocio, igual que no conoce que es un
+    "Business")."""
+    credential = await repository.get_active_credential(session, integration.id, provider_slug)
+    if credential is None:
+        raise IntegrationNotConfigured(
+            f"La integracion '{integration.slug}' no tiene credenciales activas de '{provider_slug}'."
+        )
+
+    provider = get_provider(provider_slug)
+    return await provider.create_payment_source(
+        credentials=_credentials_data(credential),
+        source_type=source_type,
+        token=token,
+        customer_email=customer_email,
+    )
+
+
+async def void_payment_source(
+    session: AsyncSession,
+    *,
+    integration: Integration,
+    payment_source_id: str,
+    provider_slug: str = "wompi",
+) -> PaymentSource:
+    credential = await repository.get_active_credential(session, integration.id, provider_slug)
+    if credential is None:
+        raise IntegrationNotConfigured(
+            f"La integracion '{integration.slug}' no tiene credenciales activas de '{provider_slug}'."
+        )
+
+    provider = get_provider(provider_slug)
+    return await provider.void_payment_source(
+        credentials=_credentials_data(credential), payment_source_id=payment_source_id
+    )
 
 
 async def handle_provider_webhook(

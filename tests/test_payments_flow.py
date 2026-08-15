@@ -419,6 +419,100 @@ async def test_charge_intent_without_pending_transaction_returns_404(client):
     assert response.status_code == 404
 
 
+async def test_charge_intent_with_nequi_has_no_redirect_url(client, httpx_mock):
+    await _seed_integration()
+    _mock_wompi_merchant(httpx_mock)
+
+    await client.post(
+        "/v1/payments/intents",
+        json={
+            "reference": "NEX-API-NEQUI",
+            "amount_cop": 50_000,
+            "redirect_url": "https://app.test/billing",
+            "customer": {"email": "cliente@test.com"},
+            "flow": "api",
+        },
+        headers=HEADERS,
+    )
+
+    _mock_wompi_merchant(httpx_mock)
+    httpx_mock.add_response(
+        url=WOMPI_TRANSACTIONS_URL,
+        method="POST",
+        status_code=201,
+        json={"data": {"id": "wompi-tx-nequi", "status": "PENDING", "reference": "NEX-API-NEQUI"}},
+    )
+
+    charge = await client.post(
+        "/v1/payments/intents/NEX-API-NEQUI/charge",
+        json={"payment_method": {"type": "NEQUI", "phone_number": "3107654321"}},
+        headers=HEADERS,
+    )
+
+    assert charge.status_code == 200
+    body = charge.json()
+    assert body["status"] == "pending"
+    assert body["redirect_url"] is None
+
+    sent_body = json.loads(httpx_mock.get_requests(url=WOMPI_TRANSACTIONS_URL)[0].content)
+    assert sent_body["payment_method"] == {"type": "NEQUI", "phone_number": "3107654321"}
+
+
+async def test_charge_intent_with_pse_returns_redirect_url(client, httpx_mock):
+    await _seed_integration()
+    _mock_wompi_merchant(httpx_mock)
+
+    await client.post(
+        "/v1/payments/intents",
+        json={
+            "reference": "NEX-API-PSE",
+            "amount_cop": 50_000,
+            "redirect_url": "https://app.test/billing",
+            "customer": {"email": "cliente@test.com"},
+            "flow": "api",
+        },
+        headers=HEADERS,
+    )
+
+    _mock_wompi_merchant(httpx_mock)
+    httpx_mock.add_response(
+        url=WOMPI_TRANSACTIONS_URL,
+        method="POST",
+        status_code=201,
+        json={
+            "data": {
+                "id": "wompi-tx-pse",
+                "status": "PENDING",
+                "reference": "NEX-API-PSE",
+                "payment_method": {
+                    "type": "PSE",
+                    "extra": {"async_payment_url": "https://sandbox.wompi.co/pse/redirect"},
+                },
+            }
+        },
+    )
+
+    charge = await client.post(
+        "/v1/payments/intents/NEX-API-PSE/charge",
+        json={
+            "payment_method": {
+                "type": "PSE",
+                "user_type": 0,
+                "user_legal_id_type": "CC",
+                "user_legal_id": "1099888777",
+                "financial_institution_code": "1",
+                "payment_description": "Suscripcion Nexolu",
+                "customer_full_name": "Cliente De Prueba",
+                "customer_phone_number": "3107654321",
+            }
+        },
+        headers=HEADERS,
+    )
+
+    assert charge.status_code == 200
+    assert charge.json()["redirect_url"] == "https://sandbox.wompi.co/pse/redirect"
+
+
 async def test_charge_intent_provider_error_marks_transaction_error_without_breaking_core(client, httpx_mock):
     # Simula que Wompi nunca acepta el intento de cobro (network/4xx antes de
     # crear la transaccion en Wompi): no va a haber webhook para este
@@ -457,3 +551,168 @@ async def test_charge_intent_provider_error_marks_transaction_error_without_brea
 
     status_response = await client.get("/v1/payments/transactions/NEX-API-ERR", headers=HEADERS)
     assert status_response.json()["status"] == "error"
+
+
+# ---------------------------------------------------------------------
+# Descubrimiento de metodos de pago: GET /payment-methods y
+# GET /pse/financial-institutions -- catalogos consultables ANTES de crear
+# un intent (ver docs/PLAN_METODOS_PAGO_ALTERNOS.md en nexolu-pos-api).
+# ---------------------------------------------------------------------
+
+
+async def test_list_payment_methods_returns_the_intersection_with_what_the_core_supports(client, httpx_mock):
+    await _seed_integration()
+    httpx_mock.add_response(
+        url=WOMPI_MERCHANT_URL,
+        json={
+            "data": {
+                "accepted_payment_methods": [
+                    "BANCOLOMBIA_TRANSFER",
+                    "NEQUI",
+                    "PSE",
+                    "CARD",
+                    "DAVIPLATA",
+                    "BANCOLOMBIA_QR",
+                ],
+            }
+        },
+    )
+
+    response = await client.get("/v1/payments/payment-methods", headers=HEADERS)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["provider"] == "wompi"
+    assert set(body["accepted_payment_methods"]) == {"CARD", "NEQUI", "PSE", "BANCOLOMBIA_TRANSFER"}
+
+
+async def test_list_payment_methods_requires_authorization(client):
+    response = await client.get("/v1/payments/payment-methods")
+    assert response.status_code == 401
+
+
+async def test_list_payment_methods_without_credentials_returns_503(client):
+    async with get_sessionmaker()() as session:
+        session.add(Integration(slug="pos-legacy", name="Nexolu POS", api_key=API_KEY, webhook_secret="s"))
+        await session.commit()
+
+    response = await client.get("/v1/payments/payment-methods", headers=HEADERS)
+    assert response.status_code == 503
+
+
+async def test_list_pse_financial_institutions_returns_the_bank_list(client, httpx_mock):
+    await _seed_integration()
+    httpx_mock.add_response(
+        url="https://sandbox.wompi.co/v1/pse/financial_institutions",
+        method="GET",
+        json={
+            "data": [
+                {"financial_institution_code": "1", "financial_institution_name": "Banco que aprueba"},
+                {"financial_institution_code": "2", "financial_institution_name": "Banco que declina"},
+            ]
+        },
+    )
+
+    response = await client.get("/v1/payments/pse/financial-institutions", headers=HEADERS)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["financial_institutions"][0] == {"code": "1", "name": "Banco que aprueba"}
+    assert body["financial_institutions"][1] == {"code": "2", "name": "Banco que declina"}
+
+
+# ---------------------------------------------------------------------
+# Fuentes de pago: guardar tarjeta/Nequi para reuso, y cobrar con ellas
+# despues -- ver docs/PLAN_METODOS_PAGO_ALTERNOS.md (repo nexolu-pos-api)
+# seccion 9.
+# ---------------------------------------------------------------------
+
+
+async def test_create_payment_source_returns_the_source_id(client, httpx_mock):
+    await _seed_integration()
+    _mock_wompi_merchant(httpx_mock)
+    httpx_mock.add_response(
+        url="https://sandbox.wompi.co/v1/payment_sources",
+        method="POST",
+        status_code=201,
+        json={"data": {"id": 3891, "type": "CARD", "status": "AVAILABLE"}},
+    )
+
+    response = await client.post(
+        "/v1/payments/payment-sources",
+        json={"type": "CARD", "token": "tok_test_123", "customer_email": "cliente@test.com"},
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["payment_source_id"] == "3891"
+    assert body["status"] == "AVAILABLE"
+
+
+async def test_create_payment_source_without_credentials_returns_503(client):
+    async with get_sessionmaker()() as session:
+        session.add(Integration(slug="pos-legacy", name="Nexolu POS", api_key=API_KEY, webhook_secret="s"))
+        await session.commit()
+
+    response = await client.post(
+        "/v1/payments/payment-sources",
+        json={"type": "CARD", "token": "tok_test_123", "customer_email": "cliente@test.com"},
+        headers=HEADERS,
+    )
+    assert response.status_code == 503
+
+
+async def test_void_payment_source_endpoint(client, httpx_mock):
+    await _seed_integration()
+    httpx_mock.add_response(
+        url="https://sandbox.wompi.co/v1/payment_sources/3891/void",
+        method="PUT",
+        json={"data": {"id": 3891, "type": "CARD", "status": "VOIDED"}},
+    )
+
+    response = await client.put("/v1/payments/payment-sources/3891/void", headers=HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "VOIDED"
+
+
+async def test_charge_intent_with_a_saved_payment_source_reuses_it_without_a_new_token(client, httpx_mock):
+    # Este es el punto central de las Fuentes de Pago: el segundo cobro NO
+    # necesita tokenizar de nuevo -- solo el payment_source_id ya guardado.
+    await _seed_integration()
+    _mock_wompi_merchant(httpx_mock)
+
+    await client.post(
+        "/v1/payments/intents",
+        json={
+            "reference": "NEX-API-SOURCE",
+            "amount_cop": 65_000,
+            "redirect_url": "https://app.test/billing",
+            "customer": {"email": "cliente@test.com"},
+            "flow": "api",
+        },
+        headers=HEADERS,
+    )
+
+    _mock_wompi_merchant(httpx_mock)
+    httpx_mock.add_response(
+        url=WOMPI_TRANSACTIONS_URL,
+        method="POST",
+        status_code=201,
+        json={"data": {"id": "wompi-tx-source", "status": "PENDING", "reference": "NEX-API-SOURCE"}},
+    )
+
+    charge = await client.post(
+        "/v1/payments/intents/NEX-API-SOURCE/charge",
+        json={"payment_method": {"type": "PAYMENT_SOURCE", "payment_source_id": "3891", "installments": 1}},
+        headers=HEADERS,
+    )
+
+    assert charge.status_code == 200
+    body = charge.json()
+    assert body["status"] == "pending"
+    assert body["provider_transaction_id"] == "wompi-tx-source"
+
+    sent_body = json.loads(httpx_mock.get_requests(url=WOMPI_TRANSACTIONS_URL)[0].content)
+    assert sent_body["payment_source_id"] == "3891"

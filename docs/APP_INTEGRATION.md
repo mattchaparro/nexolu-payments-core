@@ -253,6 +253,140 @@ intento de cobro -- p.ej. token invalido o expirado; la transaccion queda
 marcada `error` en el Core, no se queda "pending" para siempre esperando un
 webhook que nunca va a llegar porque Wompi nunca acepto la transaccion).
 
+### 2c. Otros metodos de pago (Nequi, PSE, Boton Bancolombia)
+
+`POST /intents/{reference}/charge` acepta el mismo `payment_method` de
+arriba con otros `type`. **A diferencia de CARD, estos tres son
+asincronos**: Wompi responde `PENDING` de inmediato y el usuario tiene que
+terminar el pago en otro lado (su app Nequi, o el sitio de su banco) antes
+de que llegue la confirmacion real por webhook -- ver seccion 3, la logica
+no cambia en nada.
+
+**`NEQUI`** -- el usuario recibe una notificacion push en su celular, no hay
+redirect:
+```json
+{ "payment_method": { "type": "NEQUI", "phone_number": "3107654321" } }
+```
+
+**`PSE`** -- el usuario termina el pago en el sitio de su banco. Antes de
+cobrar, consulta el banco elegido con `GET /v1/payments/pse/financial-institutions`
+(ver mas abajo):
+```json
+{
+  "payment_method": {
+    "type": "PSE",
+    "user_type": 0,
+    "user_legal_id_type": "CC",
+    "user_legal_id": "1099888777",
+    "financial_institution_code": "1",
+    "payment_description": "Pago a Tienda Wompi",
+    "customer_full_name": "Nombre Apellido",
+    "customer_phone_number": "3107654321"
+  }
+}
+```
+
+**`BANCOLOMBIA_TRANSFER`** -- el usuario termina el pago en el sitio de
+Bancolombia:
+```json
+{
+  "payment_method": {
+    "type": "BANCOLOMBIA_TRANSFER",
+    "payment_description": "Pago a Tienda Wompi",
+    "ecommerce_url": "https://tu-app.com/billing?paid=1"
+  }
+}
+```
+
+Para `PSE`/`BANCOLOMBIA_TRANSFER`, la respuesta del `charge` trae ademas
+`"redirect_url"`: a donde redirigir al usuario para que termine el pago. El
+Core espera unos segundos (con un polling corto interno a Wompi) antes de
+responder, para conseguirla -- puede venir en `null` si Wompi tarda mas de
+lo esperado; en ese caso, sigue esperando el webhook igual (`status` no
+depende de esto). Para `NEQUI`/`CARD`, `redirect_url` siempre es `null`.
+
+**Metodos de pago disponibles y bancos PSE** (consultalos al montar tu
+pantalla de checkout, no en cada cobro -- no dependen de un intent creado):
+
+```
+GET /v1/payments/payment-methods
+```
+```json
+{ "provider": "wompi", "accepted_payment_methods": ["CARD", "NEQUI", "PSE", "BANCOLOMBIA_TRANSFER"] }
+```
+Trae la interseccion entre lo que tu comercio de Wompi tiene habilitado
+(dashboard de Wompi) y lo que este Core sabe orquestar -- nunca vas a ver
+aca un metodo que `charge()` no pueda procesar. Usalo para decidir que
+botones mostrar en tu selector de metodo de pago.
+
+```
+GET /v1/payments/pse/financial-institutions
+```
+```json
+{ "financial_institutions": [{ "code": "1", "name": "Banco de Bogota" }, "..."] }
+```
+El `code` es lo que reenvias en `payment_method.financial_institution_code`.
+
+### 2d. Fuentes de pago -- guardar tarjeta/Nequi para reuso (pagos recurrentes reales)
+
+De los metodos de arriba, **solo tarjeta y Nequi** se pueden tokenizar para
+reuso genuino (sin que el usuario vuelva a intervenir en cada cobro) -- PSE
+y Boton Bancolombia siempre son de una sola vez, Wompi no ofrece
+"recordarlos". Esto es lo que Wompi llama "Fuentes de Pago", y es la base
+real de un cobro recurrente/automatico (ej. una suscripcion mensual).
+
+**Paso 1 -- tokeniza (tu frontend, directo a Wompi, llave publica)**, igual
+que ya haces para tarjeta (seccion 2b). Para Nequi es analogo:
+```js
+const r = await fetch(`https://{sandbox|production}.wompi.co/v1/tokens/nequi`, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${public_key}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ phone_number: '3107654321' }),
+});
+const { data: { id: nequiToken, status } } = await r.json(); // status: "PENDING"
+```
+El usuario recibe un push en Nequi para aprobar la suscripcion (una unica
+vez). Haz polling directo a Wompi (llave publica, sin el Core) hasta
+`"APPROVED"`:
+```
+GET https://{env}.wompi.co/v1/tokens/nequi/{nequiToken}
+Authorization: Bearer {public_key}
+```
+**Validado en sandbox**: con el celular de prueba `3991111111`, el estado
+pasa a `APPROVED` casi de inmediato sin interaccion real (Wompi lo simula) --
+en produccion, en cambio, si hace falta que el usuario apruebe en su app.
+
+**Paso 2 -- crea la fuente de pago (tu backend → Core, NUNCA el frontend):**
+```
+POST /v1/payments/payment-sources
+{ "type": "CARD" | "NEQUI", "token": "<token del paso 1>", "customer_email": "..." }
+→ { "payment_source_id": "363489", "type": "CARD", "status": "AVAILABLE" }
+```
+Esto exige la llave PRIVADA del lado de Wompi -- por eso es un endpoint del
+Core (tu app nunca ve esa llave), a diferencia de la tokenizacion del Paso 1.
+
+**Paso 3 -- cobra reusando la fuente, todas las veces que haga falta:**
+```
+POST /intents/{reference}/charge
+{ "payment_method": { "type": "PAYMENT_SOURCE", "payment_source_id": "363489", "installments": 1 } }
+```
+**Validado en sandbox**: se cobro dos veces con el mismo `payment_source_id`
+sin volver a tokenizar nada -- esto es lo que demuestra que es un cobro
+genuinamente recurrente, no uno disfrazado. `installments` solo aplica si
+la fuente es tarjeta.
+
+**Cancelar una fuente guardada:**
+```
+PUT /v1/payments/payment-sources/{id}/void
+```
+⚠️ **Limitacion real de Wompi, confirmada en sandbox**: este endpoint
+devolvio `422` ("Únicamente se pueden anular fuentes de pago con el tipo de
+operación financiera 'PREAUTHORIZATION'") contra una fuente `AVAILABLE`
+normal creada como en el Paso 2. En la practica, no cuentes con poder
+"desactivar" una fuente de pago comun via Wompi -- si tu app necesita dejar
+de usarla, hazlo de tu lado (deja de ofrecerla/guardarla), no dependas de
+que Wompi la bloquee.
+
 ### `GET /v1/payments/transactions/{reference}`
 
 Mismo uso en ambos flujos: tu frontend puede consultar esto mientras espera
@@ -413,10 +547,12 @@ usas para verificar que un webhook realmente vino del Core.
   si una transaccion se queda `pending` mucho tiempo despues de un `charge`
   exitoso (ack inmediato recibido pero el webhook nunca llega), hoy no hay
   un job que le pregunte a Wompi por su estado real.
-- `flow: "api"` por ahora solo soporta `payment_method.type: "CARD"`. Nequi
-  y PSE via API directa (Wompi los soporta, con flujos de confirmacion
-  distintos -- push notification y redireccion al banco respectivamente) no
-  estan implementados: usa `flow: "widget"` para esos metodos por ahora.
+- `flow: "api"` soporta `CARD`, `NEQUI`, `PSE` y `BANCOLOMBIA_TRANSFER`
+  (seccion 2c). Otros metodos que Wompi soporta (DAVIPLATA, BANCOLOMBIA_QR,
+  BNPL, SU+ Pay, pago en efectivo en corresponsales) no estan implementados
+  todavia -- usa `flow: "widget"` para esos por ahora. `GET
+  /v1/payments/payment-methods` siempre refleja la lista real soportada, no
+  hace falta memorizar esta.
 
 ## 7. Validacion de `flow: "api"` (2026-08-14)
 
@@ -443,3 +579,58 @@ usas para verificar que un webhook realmente vino del Core.
   Wompi con tarjeta tokenizada, la verificacion de firma del webhook
   entrante, y el calculo de comision -- todo igual que en el flujo Widget,
   como establece la seccion 1.
+
+## 8. Validacion de Nequi / PSE / Boton Bancolombia (2026-08-15)
+
+- **Suite automatizada**: `pytest -v` -- 42/42 pasan, incluidos los tests
+  nuevos de `charge()` por metodo (con `httpx_mock`, incluido el polling de
+  `redirect_url` acotado) y de `GET /payment-methods` /
+  `GET /pse/financial-institutions`.
+- **Contra Wompi sandbox real** (`scripts/test_direct_api_flow.py --payment-method {nequi,pse,bancolombia_transfer}`),
+  con el comercio sandbox real (11 metodos habilitados en Wompi, filtrados a
+  4 por `GET /payment-methods`):
+  - `NEQUI` (celular `3991111111`): `charge()` devolvio ack `PENDING`,
+    `redirect_url: null` (correcto, es push notification, no redirect).
+  - `PSE`: `GET /pse/financial-institutions` devolvio los 3 bancos de
+    prueba reales de Wompi; `charge()` con el banco `"1"` devolvio un
+    `redirect_url` real de Wompi (`api-sandbox.wompi.co/v1/pse/redirect?...`),
+    extraido por el polling interno sin tener que alargar el tope de 8
+    intentos -- aparecio dentro del primer intento en la practica.
+  - `BANCOLOMBIA_TRANSFER`: **la doc de Wompi no fue suficiente** -- el
+    primer intento devolvio `422` (`user_type: "No esta presente. Debe ser
+    uno de estos: PERSON"`), un campo que el ejemplo principal de
+    docs.wompi.co no muestra (si aparece en un ejemplo mas abajo en la misma
+    pagina, para "segundo medio de pago"). Se agrego `"user_type": "PERSON"`
+    fijo en `_payment_method_payload` (`providers/wompi.py`) y quedo
+    validado con un `redirect_url` real tras el fix.
+- No se repitio el webhook real de punta a punta (tunel + dashboard de
+  Wompi) para estos tres metodos porque el procesamiento del webhook
+  entrante es agnostico del metodo de pago (confirmado leyendo
+  `parse_webhook_event`/`verify_webhook_signature`, no miran `payment_method`)
+  y ya quedo validado con tarjeta en la seccion 7 -- lo nuevo aca (el
+  `payment_method` correcto por tipo, y el polling de `redirect_url`) si se
+  validó contra la API real de Wompi, no solo con mocks.
+
+## 9. Validacion de Fuentes de Pago (2026-08-15)
+
+- **Suite automatizada**: `pytest -v` -- 51/51 pasan, incluidos los tests
+  nuevos de `create_payment_source`/`void_payment_source`/`charge()` con
+  `PaymentSourceChargeMethod`.
+- **Contra Wompi sandbox real**: tokenizacion de tarjeta (llave publica) →
+  `POST /payment-sources` (llave privada) → **dos cobros con el MISMO
+  `payment_source_id`, sin volver a tokenizar** -- esto es lo que demuestra
+  que el reuso es real, no solo que el endpoint responde `200`. Tambien se
+  probo con Nequi: `POST /tokens/nequi` con el celular de prueba
+  `3991111111` pasa a `APPROVED` casi de inmediato en sandbox (sin
+  interaccion real necesaria ahi, a diferencia de produccion), y la fuente
+  de pago resultante tambien se cobro exitosamente.
+- **Limitacion real encontrada**: `PUT /payment-sources/{id}/void` devolvio
+  un error real de Wompi contra una fuente `AVAILABLE` normal --
+  "Únicamente se pueden anular fuentes de pago con el tipo de operación
+  financiera 'PREAUTHORIZATION'". El endpoint del Core esta bien
+  implementado (llega a Wompi, maneja el error correctamente como
+  `ProviderRequestError` → `502`), pero **no asumas que sirve para
+  "eliminar" una fuente de pago comun** -- documentado en sección 2d para
+  que quien construya el lado del negocio (`nexolu-pos-api`) no dependa de
+  esto para su UX de "eliminar método guardado" (ahi la solucion es un
+  soft-delete de su lado, no depender de que Wompi bloquee la fuente).

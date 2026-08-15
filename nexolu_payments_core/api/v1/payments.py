@@ -20,7 +20,7 @@ hacer polling mientras tanto.
 """
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Union
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -31,7 +31,15 @@ from nexolu_payments_core.core.memory import repository
 from nexolu_payments_core.core.memory.db import get_session
 from nexolu_payments_core.core.memory.entities import Integration
 from nexolu_payments_core.core.payments import service
-from nexolu_payments_core.providers.base import CardPaymentMethod, ProviderRequestError
+from nexolu_payments_core.providers.base import (
+    BancolombiaTransferPaymentMethod,
+    CardPaymentMethod,
+    NequiPaymentMethod,
+    PaymentMethodInput,
+    PaymentSourceChargeMethod,
+    ProviderRequestError,
+    PsePaymentMethod,
+)
 
 router = APIRouter(prefix="/v1/payments", tags=["payments"])
 
@@ -82,8 +90,93 @@ class CardPaymentMethodIn(BaseModel):
     installments: int = Field(default=1, ge=1, description="Numero de cuotas.")
 
 
+class NequiPaymentMethodIn(BaseModel):
+    type: Literal["NEQUI"] = "NEQUI"
+    phone_number: str = Field(
+        pattern=r"^3\d{9}$",
+        description="Celular colombiano de 10 digitos registrado con Nequi.",
+    )
+
+
+class PsePaymentMethodIn(BaseModel):
+    type: Literal["PSE"] = "PSE"
+    user_type: int = Field(ge=0, le=1, description="0 = persona natural, 1 = persona juridica.")
+    user_legal_id_type: str = Field(description="Tipo de documento del pagador (ej. CC, NIT).")
+    user_legal_id: str = Field(description="Numero de documento del pagador.")
+    financial_institution_code: str = Field(
+        description="Codigo del banco elegido, de GET /v1/payments/pse/financial-institutions."
+    )
+    payment_description: str = Field(max_length=64, description="Descripcion del pago, sin comillas simples.")
+    customer_full_name: str = Field(description="Nombre completo del pagador.")
+    customer_phone_number: str = Field(description="Telefono del pagador.")
+
+
+class BancolombiaTransferPaymentMethodIn(BaseModel):
+    type: Literal["BANCOLOMBIA_TRANSFER"] = "BANCOLOMBIA_TRANSFER"
+    payment_description: str = Field(max_length=64, description="Descripcion del pago, sin comillas simples.")
+    ecommerce_url: str = Field(description="A donde te redirige Wompi tras completar el pago en Bancolombia.")
+
+
+class PaymentSourceChargeMethodIn(BaseModel):
+    type: Literal["PAYMENT_SOURCE"] = "PAYMENT_SOURCE"
+    payment_source_id: str = Field(description="Id devuelto por POST /payment-sources.")
+    installments: int = Field(default=1, ge=1, description="Solo aplica si la fuente es una tarjeta.")
+
+
+PaymentMethodIn = Annotated[
+    Union[
+        CardPaymentMethodIn,
+        NequiPaymentMethodIn,
+        PsePaymentMethodIn,
+        BancolombiaTransferPaymentMethodIn,
+        PaymentSourceChargeMethodIn,
+    ],
+    Field(discriminator="type"),
+]
+
+
 class ChargeIn(BaseModel):
-    payment_method: CardPaymentMethodIn
+    payment_method: PaymentMethodIn
+
+
+def _to_payment_method(payment_method_in: PaymentMethodIn) -> PaymentMethodInput:
+    if isinstance(payment_method_in, CardPaymentMethodIn):
+        return CardPaymentMethod(token=payment_method_in.token, installments=payment_method_in.installments)
+    if isinstance(payment_method_in, NequiPaymentMethodIn):
+        return NequiPaymentMethod(phone_number=payment_method_in.phone_number)
+    if isinstance(payment_method_in, PsePaymentMethodIn):
+        return PsePaymentMethod(
+            user_type=payment_method_in.user_type,
+            user_legal_id_type=payment_method_in.user_legal_id_type,
+            user_legal_id=payment_method_in.user_legal_id,
+            financial_institution_code=payment_method_in.financial_institution_code,
+            payment_description=payment_method_in.payment_description,
+            customer_full_name=payment_method_in.customer_full_name,
+            customer_phone_number=payment_method_in.customer_phone_number,
+        )
+    if isinstance(payment_method_in, BancolombiaTransferPaymentMethodIn):
+        return BancolombiaTransferPaymentMethod(
+            payment_description=payment_method_in.payment_description,
+            ecommerce_url=payment_method_in.ecommerce_url,
+        )
+    return PaymentSourceChargeMethod(
+        payment_source_id=payment_method_in.payment_source_id,
+        installments=payment_method_in.installments,
+    )
+
+
+class CreatePaymentSourceIn(BaseModel):
+    type: Literal["CARD", "NEQUI"] = Field(
+        description="Unicos dos tipos que Wompi permite tokenizar para reuso (ver docs/APP_INTEGRATION.md)."
+    )
+    token: str = Field(
+        description=(
+            "Token ya obtenido por TU FRONTEND hablando directo con el proveedor "
+            "(POST /tokens/cards o /tokens/nequi con la public_key -- nunca con el Core). "
+            "Para Nequi, debe estar en status APPROVED (el usuario ya acepto la suscripcion en su celular)."
+        )
+    )
+    customer_email: str = Field(description="Correo del cliente dueno de la fuente de pago.")
 
 
 @router.post(
@@ -150,9 +243,7 @@ async def charge_intent(
     integration: Integration = Depends(get_current_integration),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    payment_method = CardPaymentMethod(
-        token=body.payment_method.token, installments=body.payment_method.installments
-    )
+    payment_method = _to_payment_method(body.payment_method)
 
     try:
         transaction, result = await service.charge_payment_intent(
@@ -189,7 +280,113 @@ async def charge_intent(
         "status": transaction.status,
         "provider_transaction_id": result.provider_transaction_id,
         "provider_status": result.raw_status,
+        # Solo poblado para PSE/BANCOLOMBIA_TRANSFER: a donde redirigir al
+        # usuario para que termine el pago en el sitio de su banco. `None`
+        # para CARD/NEQUI, o si el proveedor no lo entrego a tiempo (ver
+        # providers/wompi.py) -- en ese caso seguir esperando el webhook.
+        "redirect_url": result.redirect_url,
     }
+
+
+@router.get(
+    "/payment-methods",
+    summary="Metodos de pago disponibles",
+    response_description="Los que el proveedor tiene habilitados, filtrados a lo que este Core sabe orquestar.",
+)
+async def list_payment_methods(
+    integration: Integration = Depends(get_current_integration),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        methods = await service.get_available_payment_methods(session, integration=integration)
+    except service.IntegrationNotConfigured as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except ProviderRequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"No se pudo consultar los metodos de pago disponibles: {exc}",
+        ) from exc
+
+    return {"provider": "wompi", "accepted_payment_methods": methods}
+
+
+@router.get(
+    "/pse/financial-institutions",
+    summary="Bancos disponibles para pagar por PSE",
+)
+async def list_pse_financial_institutions(
+    integration: Integration = Depends(get_current_integration),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        institutions = await service.get_pse_financial_institutions(session, integration=integration)
+    except service.IntegrationNotConfigured as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except ProviderRequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"No se pudo consultar los bancos PSE: {exc}",
+        ) from exc
+
+    return {
+        "financial_institutions": [
+            {"code": institution.code, "name": institution.name} for institution in institutions
+        ]
+    }
+
+
+@router.post(
+    "/payment-sources",
+    status_code=status.HTTP_201_CREATED,
+    summary="Guardar una tarjeta o cuenta Nequi para reuso (Fuentes de Pago)",
+    response_description="El payment_source_id, para reusar en POST /intents/{reference}/charge.",
+)
+async def create_payment_source(
+    body: CreatePaymentSourceIn,
+    integration: Integration = Depends(get_current_integration),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        source = await service.create_payment_source(
+            session,
+            integration=integration,
+            source_type=body.type,
+            token=body.token,
+            customer_email=body.customer_email,
+        )
+    except service.IntegrationNotConfigured as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except ProviderRequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"No se pudo crear la fuente de pago con el proveedor: {exc}",
+        ) from exc
+
+    return {"payment_source_id": source.id, "type": source.type, "status": source.status}
+
+
+@router.put(
+    "/payment-sources/{payment_source_id}/void",
+    summary="Cancelar una fuente de pago guardada",
+)
+async def void_payment_source(
+    payment_source_id: str,
+    integration: Integration = Depends(get_current_integration),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        source = await service.void_payment_source(
+            session, integration=integration, payment_source_id=payment_source_id
+        )
+    except service.IntegrationNotConfigured as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except ProviderRequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"No se pudo cancelar la fuente de pago con el proveedor: {exc}",
+        ) from exc
+
+    return {"payment_source_id": source.id, "type": source.type, "status": source.status}
 
 
 @router.get(
