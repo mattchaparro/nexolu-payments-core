@@ -2,6 +2,20 @@
 saliente. Los endpoints HTTP (`api/v1/payments.py`, `api/v1/webhooks.py`) son
 delgados a proposito -- toda la logica vive aca para poder probarla sin
 levantar la app.
+
+Dos formas de completar un pago conviven (ver docs/APP_INTEGRATION.md):
+
+- **Widget (legado)**: `create_payment_intent` arma los parametros de
+  checkout y la app abre el widget del proveedor; el resultado llega
+  siempre por webhook (`handle_provider_webhook`).
+- **API directa**: `create_payment_intent(..., flow="api")` arma en su
+  lugar `payment_init` (tokens de aceptacion + firma) para que el frontend
+  tokenice la tarjeta hablando directo con el proveedor; despues
+  `charge_payment_intent` le pide al Core que intente cobrar esa tarjeta ya
+  tokenizada. El resultado FINAL sigue llegando siempre por webhook -- lo
+  que devuelve `charge_payment_intent` es solo el ack inmediato del
+  proveedor (ver `ProviderRequestError`/`ChargeResult` en
+  `providers/base.py`).
 """
 from __future__ import annotations
 
@@ -14,7 +28,12 @@ from nexolu_payments_core.core.memory import repository
 from nexolu_payments_core.core.memory.entities import Integration, ProviderCredential, Transaction
 from nexolu_payments_core.core.payments.fees import calculate_fee_cop
 from nexolu_payments_core.core.webhooks.dispatcher import dispatch_transaction_event
-from nexolu_payments_core.providers.base import ProviderCredentialsData
+from nexolu_payments_core.providers.base import (
+    CardPaymentMethod,
+    ChargeResult,
+    ProviderCredentialsData,
+    ProviderRequestError,
+)
 from nexolu_payments_core.providers.registry import get_provider
 
 _EVENT_BY_KIND = {
@@ -31,6 +50,12 @@ class IntegrationNotConfigured(Exception):
 
 class DuplicateReference(Exception):
     """Ya existe una transaccion con esa `reference` para esta integracion."""
+
+
+class TransactionNotChargeable(Exception):
+    """No existe una transaccion `pending` con esa `reference` para esta
+    integracion -- o nunca se creo el intent, o ya se intento/confirmo un
+    cobro para ella (no es idempotente reintentar un charge)."""
 
 
 def _credentials_data(credential: ProviderCredential) -> ProviderCredentialsData:
@@ -53,7 +78,8 @@ async def create_payment_intent(
     customer: dict[str, Any],
     metadata: dict[str, Any],
     provider_slug: str = "wompi",
-) -> tuple[Transaction, dict[str, Any]]:
+    flow: str = "widget",
+) -> tuple[Transaction, dict[str, Any], dict[str, Any] | None]:
     if await repository.get_transaction_by_reference(session, integration.id, reference):
         raise DuplicateReference(reference)
 
@@ -64,14 +90,38 @@ async def create_payment_intent(
         )
 
     provider = get_provider(provider_slug)
+    credentials = _credentials_data(credential)
+
     checkout = provider.build_checkout(
         reference=reference,
         amount_cop=amount_cop,
         currency=currency,
-        credentials=_credentials_data(credential),
+        credentials=credentials,
         redirect_url=redirect_url,
         customer=customer,
     )
+
+    # `payment_init` (API directa) requiere una llamada de red al proveedor
+    # (tokens de aceptacion legal) -- se pide ANTES de crear la fila de
+    # Transaction para no dejar un intent "pending" huerfano en el Core si
+    # el proveedor no responde.
+    payment_init_out: dict[str, Any] | None = None
+    if flow == "api":
+        payment_init = await provider.build_payment_init(
+            reference=reference,
+            amount_cop=amount_cop,
+            currency=currency,
+            credentials=credentials,
+        )
+        payment_init_out = {
+            "public_key": payment_init.public_key,
+            "amount_in_cents": payment_init.amount_in_cents,
+            "currency": payment_init.currency,
+            "reference": payment_init.reference,
+            "integrity_signature": payment_init.integrity_signature,
+            "acceptance_token": payment_init.acceptance_token,
+            "accept_personal_auth": payment_init.accept_personal_auth,
+        }
 
     transaction = Transaction(
         integration_id=integration.id,
@@ -96,7 +146,58 @@ async def create_payment_intent(
         "customer_data": checkout.customer_data,
     }
 
-    return transaction, checkout_out
+    return transaction, checkout_out, payment_init_out
+
+
+async def charge_payment_intent(
+    session: AsyncSession,
+    *,
+    integration: Integration,
+    reference: str,
+    payment_method: CardPaymentMethod,
+    provider_slug: str = "wompi",
+) -> tuple[Transaction, ChargeResult]:
+    """API directa: le pide al proveedor que intente cobrar una tarjeta ya
+    tokenizada por el frontend de la app. El estado LOCAL de la transaccion
+    se queda en `pending` pase lo que pase aca (incluso si el proveedor ya
+    respondio "APPROVED" de forma sincrona) -- la fuente de verdad sigue
+    siendo el webhook, ver el modulo docstring y `handle_provider_webhook`.
+
+    Excepcion: si el proveedor ni siquiera acepta el intento
+    (`ProviderRequestError`, ver `providers/base.py`), no va a haber webhook
+    para esta transaccion nunca -- se marca `error` de una vez aca para no
+    dejarla en `pending` indefinidamente.
+    """
+    transaction = await repository.get_transaction_by_reference(session, integration.id, reference)
+    if transaction is None or transaction.status != "pending":
+        raise TransactionNotChargeable(reference)
+
+    credential = await repository.get_active_credential(session, integration.id, provider_slug)
+    if credential is None:
+        raise IntegrationNotConfigured(
+            f"La integracion '{integration.slug}' no tiene credenciales activas de '{provider_slug}'."
+        )
+
+    provider = get_provider(provider_slug)
+
+    try:
+        result = await provider.charge(
+            reference=transaction.reference,
+            amount_cop=transaction.amount_cop,
+            currency=transaction.currency,
+            customer_email=transaction.customer_email or "",
+            credentials=_credentials_data(credential),
+            payment_method=payment_method,
+        )
+    except ProviderRequestError:
+        transaction.status = "error"
+        await session.commit()
+        raise
+
+    transaction.provider_transaction_id = result.provider_transaction_id
+    await session.commit()
+
+    return transaction, result
 
 
 async def handle_provider_webhook(

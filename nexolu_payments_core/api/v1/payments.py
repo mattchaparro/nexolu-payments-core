@@ -3,10 +3,24 @@
 Autenticado con la `api_key` de la integracion (`Authorization: Bearer
 <api_key>`). Ver docs/APP_INTEGRATION.md para el flujo completo, incluido lo
 que la app debe exponer de vuelta (el webhook saliente).
+
+Dos formas de completar el cobro (`POST /intents` con `flow`):
+
+- `flow="widget"` (default, legado): la respuesta trae `checkout` -- la app
+  abre el widget hospedado por el proveedor con esos parametros.
+- `flow="api"`: la respuesta trae ademas `payment_init` -- el frontend de la
+  app tokeniza la tarjeta hablando DIRECTO con el proveedor (nunca con el
+  Core) usando `payment_init.public_key`, y luego la app llama
+  `POST /intents/{reference}/charge` con el token resultante.
+
+En ambos casos el resultado final de la transaccion llega por
+`POST /v1/webhooks/wompi/<slug>` (ver `api/v1/webhooks.py`), nunca por lo
+que devuelve el navegador -- `GET /transactions/{reference}` sirve para
+hacer polling mientras tanto.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -17,35 +31,74 @@ from nexolu_payments_core.core.memory import repository
 from nexolu_payments_core.core.memory.db import get_session
 from nexolu_payments_core.core.memory.entities import Integration
 from nexolu_payments_core.core.payments import service
+from nexolu_payments_core.providers.base import CardPaymentMethod, ProviderRequestError
 
 router = APIRouter(prefix="/v1/payments", tags=["payments"])
 
 
 class CustomerIn(BaseModel):
-    email: str
-    full_name: str = ""
+    email: str = Field(description="Correo del cliente final (Wompi lo usa para el comprobante).")
+    full_name: str = Field(default="", description="Nombre del cliente final.")
 
 
 class PaymentIntentIn(BaseModel):
     # La app integradora genera su propia reference (igual que hoy hace
     # pos-saas-legacy con "NEX-<business_id>-<timestamp>-<random>"): es lo
     # que usa para conciliar contra su propia orden/factura.
-    reference: str = Field(min_length=3, max_length=128)
-    amount_cop: int = Field(gt=0)
-    currency: str = "COP"
-    redirect_url: str
+    reference: str = Field(
+        min_length=3,
+        max_length=128,
+        description="Identificador unico tuyo para esta transaccion (tu orden/factura).",
+    )
+    amount_cop: int = Field(gt=0, description="Monto a cobrar en pesos colombianos (no en centavos).")
+    currency: str = Field(default="COP", description="Por ahora solo se soporta COP.")
+    redirect_url: str = Field(description="A donde redirigir al usuario tras pagar (solo aplica al flujo Widget).")
     customer: CustomerIn
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Datos tuyos (ids internos, dias de suscripcion...); el Core no los interpreta, "
+            "solo te los reenvia en el webhook."
+        ),
+    )
+    flow: Literal["widget", "api"] = Field(
+        default="widget",
+        description=(
+            "'widget' (default, legado): la respuesta trae `checkout` para abrir el widget del proveedor. "
+            "'api': la respuesta trae ademas `payment_init` para completar el cobro sin salir de tu app, "
+            "ver POST /intents/{reference}/charge."
+        ),
+    )
 
 
-@router.post("/intents", status_code=status.HTTP_201_CREATED)
+class CardPaymentMethodIn(BaseModel):
+    type: Literal["CARD"] = "CARD"
+    token: str = Field(
+        description=(
+            "Token de tarjeta que TU FRONTEND obtuvo hablando directo con el proveedor "
+            "(usando `payment_init.public_key` del intent) -- el Core nunca recibe el numero de tarjeta."
+        )
+    )
+    installments: int = Field(default=1, ge=1, description="Numero de cuotas.")
+
+
+class ChargeIn(BaseModel):
+    payment_method: CardPaymentMethodIn
+
+
+@router.post(
+    "/intents",
+    status_code=status.HTTP_201_CREATED,
+    summary="Crear un intent de pago",
+    response_description="El intent creado, con los parametros de checkout del flujo elegido.",
+)
 async def create_intent(
     body: PaymentIntentIn,
     integration: Integration = Depends(get_current_integration),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     try:
-        transaction, checkout = await service.create_payment_intent(
+        transaction, checkout, payment_init = await service.create_payment_intent(
             session,
             integration=integration,
             reference=body.reference,
@@ -54,6 +107,7 @@ async def create_intent(
             redirect_url=body.redirect_url,
             customer=body.customer.model_dump(),
             metadata=body.metadata,
+            flow=body.flow,
         )
     except service.DuplicateReference:
         raise HTTPException(
@@ -61,19 +115,87 @@ async def create_intent(
         ) from None
     except service.IntegrationNotConfigured as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except ProviderRequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"No se pudo preparar el pago con el proveedor: {exc}",
+        ) from exc
 
     await session.commit()
 
-    return {
+    out: dict[str, Any] = {
         "transaction_id": transaction.id,
         "reference": transaction.reference,
         "provider": transaction.provider_slug,
         "status": transaction.status,
         "checkout": checkout,
     }
+    # Solo se agrega si se pidio flow="api" -- para flow="widget" (default)
+    # la respuesta es identica, campo por campo, a la de antes de este
+    # cambio (ver docs/APP_INTEGRATION.md, seccion de migracion).
+    if payment_init is not None:
+        out["payment_init"] = payment_init
+
+    return out
 
 
-@router.get("/transactions/{reference}")
+@router.post(
+    "/intents/{reference}/charge",
+    summary="Cobrar un intent con una tarjeta ya tokenizada (API directa)",
+    response_description="Ack inmediato del proveedor. El estado final llega por webhook.",
+)
+async def charge_intent(
+    reference: str,
+    body: ChargeIn,
+    integration: Integration = Depends(get_current_integration),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payment_method = CardPaymentMethod(
+        token=body.payment_method.token, installments=body.payment_method.installments
+    )
+
+    try:
+        transaction, result = await service.charge_payment_intent(
+            session,
+            integration=integration,
+            reference=reference,
+            payment_method=payment_method,
+        )
+    except service.TransactionNotChargeable:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "No hay una transaccion pendiente con esa reference "
+                "(el intent se creo con flow='api'?, ya se cobro antes?)."
+            ),
+        ) from None
+    except service.IntegrationNotConfigured as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except ProviderRequestError as exc:
+        # El proveedor nunca acepto el intento de cobro: no va a haber
+        # webhook para este reference. `charge_payment_intent` ya dejo la
+        # transaccion en `error` -- el contrato del Core no se rompe, solo
+        # se le informa a la app que el proveedor fallo.
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"No se pudo iniciar el cobro con el proveedor: {exc}",
+        ) from exc
+
+    return {
+        "transaction_id": transaction.id,
+        "reference": transaction.reference,
+        # Se queda "pending" a proposito: la confirmacion real llega por
+        # webhook, ver GET /transactions/{reference} para hacer polling.
+        "status": transaction.status,
+        "provider_transaction_id": result.provider_transaction_id,
+        "provider_status": result.raw_status,
+    }
+
+
+@router.get(
+    "/transactions/{reference}",
+    summary="Consultar el estado de una transaccion",
+)
 async def get_transaction(
     reference: str,
     integration: Integration = Depends(get_current_integration),
