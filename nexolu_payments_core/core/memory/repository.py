@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nexolu_payments_core.core.memory.entities import FeeSchedule, Integration, Merchant, ProviderCredential, Transaction
+from nexolu_payments_core.core.security.api_keys import hash_api_key
 
 
 async def get_merchant_by_id(session: AsyncSession, merchant_id: str) -> Merchant | None:
@@ -17,7 +18,7 @@ async def get_merchant_by_slug(session: AsyncSession, slug: str) -> Merchant | N
 
 async def get_integration_by_api_key(session: AsyncSession, api_key: str) -> Integration | None:
     stmt = select(Integration).join(Merchant, Merchant.id == Integration.merchant_id).where(
-        Integration.api_key == api_key,
+        Integration.api_key_hash == hash_api_key(api_key),
         Integration.is_active.is_(True),
         Merchant.is_active.is_(True),
     )
@@ -29,8 +30,7 @@ async def get_integration_by_id(session: AsyncSession, integration_id: str) -> I
 
 
 async def get_integration_by_slug(session: AsyncSession, slug: str) -> Integration | None:
-    stmt = select(Integration).where(Integration.slug == slug, Integration.is_active.is_(True))
-    return (await session.execute(stmt)).scalar_one_or_none()
+    return (await session.execute(select(Integration).where(Integration.slug == slug, Integration.is_active.is_(True)))).scalar_one_or_none()
 
 
 async def get_active_credential(session: AsyncSession, merchant_id: str, provider_slug: str, environment: str = "sandbox") -> ProviderCredential | None:
