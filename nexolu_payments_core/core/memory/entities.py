@@ -8,6 +8,7 @@ from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Intege
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from nexolu_payments_core.core.memory.db import Base
+from nexolu_payments_core.core.security.api_keys import hash_api_key
 from nexolu_payments_core.core.security.crypto import EncryptedString
 
 
@@ -38,13 +39,20 @@ class Integration(Base):
     slug: Mapped[str] = mapped_column(String(64), unique=True)
     name: Mapped[str] = mapped_column(String(128))
     environment: Mapped[str] = mapped_column(String(16), default="sandbox")
-    api_key_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    api_key: Mapped[str] = mapped_column(EncryptedString(255), nullable=False)
+    api_key_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     webhook_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     webhook_secret: Mapped[str] = mapped_column(EncryptedString(255), default=lambda: _secret("whsec"))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     merchant: Mapped[Merchant] = relationship(back_populates="integrations")
     fee_schedules: Mapped[list[FeeSchedule]] = relationship(back_populates="integration")
+
+    def __init__(self, **kwargs):
+        api_key = kwargs.pop("api_key", None) or _secret("nxl")
+        self.api_key = api_key
+        self.api_key_hash = hash_api_key(api_key)
+        super().__init__(**kwargs)
 
 
 class ProviderCredential(Base):
