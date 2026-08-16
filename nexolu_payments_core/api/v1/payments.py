@@ -1,20 +1,34 @@
-"""Public payment API consumed by registered applications."""
+"""Public payment API plus protected provisioning endpoints.
+
+Payment calls use the Integration API key. Provisioning calls use a server-side
+provisioning key and are intended for a trusted management backend, not a
+browser.
+"""
 from __future__ import annotations
 
+import secrets
 from typing import Annotated, Any, Literal, Union
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nexolu_payments_core.config import get_settings
 from nexolu_payments_core.core.auth.dependencies import get_current_integration
 from nexolu_payments_core.core.memory import repository
 from nexolu_payments_core.core.memory.db import get_session
-from nexolu_payments_core.core.memory.entities import Integration
+from nexolu_payments_core.core.memory.entities import Integration, Merchant, ProviderCredential
 from nexolu_payments_core.core.payments import service
 from nexolu_payments_core.providers.base import BancolombiaTransferPaymentMethod, CardPaymentMethod, NequiPaymentMethod, PaymentMethodInput, PaymentSourceChargeMethod, ProviderRequestError, PsePaymentMethod
 
 router = APIRouter(prefix="/v1/payments", tags=["payments"])
+provisioning_router = APIRouter(prefix="/v1/admin", tags=["admin"])
+
+
+def _require_provisioning_key(value: str | None) -> None:
+    configured = get_settings().provisioning_key
+    if not configured or not value or not secrets.compare_digest(value, configured):
+        raise HTTPException(status_code=401, detail="Provisioning key invalida.")
 
 
 class CustomerIn(BaseModel):
@@ -90,7 +104,7 @@ class CreatePaymentSourceIn(BaseModel):
     customer_email: str
 
 
-@router.post("/intents", status_code=status.HTTP_201_CREATED, summary="Create a payment intent")
+@router.post("/intents", status_code=201, summary="Create a payment intent")
 async def create_intent(body: PaymentIntentIn, integration: Integration = Depends(get_current_integration), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     try:
         transaction, checkout, payment_init = await service.create_payment_intent(session, integration=integration, amount_cop=body.amount_cop, currency=body.currency, redirect_url=body.redirect_url, customer=body.customer.model_dump(), metadata=body.metadata, flow=body.flow)
@@ -168,3 +182,81 @@ async def get_transaction(reference: str, integration: Integration = Depends(get
     if transaction is None or transaction.integration_id != integration.id:
         raise HTTPException(status_code=404, detail="Transaccion no encontrada.")
     return {"transaction_id": transaction.id, "reference": transaction.reference, "provider": transaction.provider_slug, "status": transaction.status, "amount_cop": transaction.amount_cop, "currency": transaction.currency, "fee_cop": transaction.fee_cop, "net_amount_cop": transaction.net_amount_cop, "provider_transaction_id": transaction.provider_transaction_id, "created_at": transaction.created_at, "confirmed_at": transaction.confirmed_at}
+
+
+class MerchantIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    slug: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$")
+
+
+class IntegrationIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    slug: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    environment: str = Field(default="sandbox", pattern=r"^(sandbox|production)$")
+    webhook_url: str | None = None
+
+
+class WompiCredentialsIn(BaseModel):
+    environment: str = Field(default="sandbox", pattern=r"^(sandbox|production)$")
+    public_key: str
+    private_key: str
+    integrity_secret: str
+    events_secret: str
+
+
+@provisioning_router.post("/merchants", status_code=201, summary="Create a merchant")
+async def create_merchant(body: MerchantIn, x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    _require_provisioning_key(x_payments_provisioning_key)
+    if await repository.get_merchant_by_slug(session, body.slug):
+        raise HTTPException(status_code=409, detail="El merchant ya existe.")
+    merchant = Merchant(name=body.name, slug=body.slug)
+    session.add(merchant)
+    await session.flush()
+    await session.commit()
+    return {"id": merchant.id, "name": merchant.name, "slug": merchant.slug, "is_active": merchant.is_active}
+
+
+@provisioning_router.get("/merchants/{merchant_id}", summary="Get merchant")
+async def get_merchant(merchant_id: str, x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    _require_provisioning_key(x_payments_provisioning_key)
+    merchant = await repository.get_merchant_by_id(session, merchant_id)
+    if merchant is None:
+        raise HTTPException(status_code=404, detail="Merchant no encontrado.")
+    return {"id": merchant.id, "name": merchant.name, "slug": merchant.slug, "is_active": merchant.is_active}
+
+
+@provisioning_router.post("/merchants/{merchant_id}/integrations", status_code=201, summary="Create an integration")
+async def create_integration(merchant_id: str, body: IntegrationIn, x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    _require_provisioning_key(x_payments_provisioning_key)
+    merchant = await repository.get_merchant_by_id(session, merchant_id)
+    if merchant is None:
+        raise HTTPException(status_code=404, detail="Merchant no encontrado.")
+    if await repository.get_integration_by_slug(session, body.slug):
+        raise HTTPException(status_code=409, detail="La integration ya existe.")
+    integration = Integration(merchant_id=merchant.id, name=body.name, slug=body.slug, environment=body.environment, webhook_url=body.webhook_url)
+    session.add(integration)
+    await session.flush()
+    await session.commit()
+    return {"id": integration.id, "merchant_id": integration.merchant_id, "name": integration.name, "slug": integration.slug, "environment": integration.environment, "api_key": integration.api_key, "webhook_secret": integration.webhook_secret}
+
+
+@provisioning_router.post("/merchants/{merchant_id}/providers/wompi", status_code=201, summary="Configure Wompi credentials")
+async def configure_wompi(merchant_id: str, body: WompiCredentialsIn, x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    _require_provisioning_key(x_payments_provisioning_key)
+    merchant = await repository.get_merchant_by_id(session, merchant_id)
+    if merchant is None:
+        raise HTTPException(status_code=404, detail="Merchant no encontrado.")
+    if await repository.get_active_credential(session, merchant.id, "wompi", body.environment):
+        raise HTTPException(status_code=409, detail="Ya existe una credencial Wompi activa para este merchant y entorno.")
+    credential = ProviderCredential(merchant_id=merchant.id, provider_slug="wompi", environment=body.environment, public_key=body.public_key, private_key=body.private_key, integrity_secret=body.integrity_secret, events_secret=body.events_secret)
+    session.add(credential)
+    await session.flush()
+    await session.commit()
+    return {"id": credential.id, "merchant_id": merchant.id, "provider": "wompi", "environment": credential.environment, "configured": True}
+
+
+@provisioning_router.get("/merchants/{merchant_id}/providers/wompi", summary="Get Wompi configuration status")
+async def get_wompi_status(merchant_id: str, environment: str = "sandbox", x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    _require_provisioning_key(x_payments_provisioning_key)
+    credential = await repository.get_active_credential(session, merchant_id, "wompi", environment)
+    return {"provider": "wompi", "environment": environment, "configured": credential is not None, "public_key": credential.public_key if credential else None}
