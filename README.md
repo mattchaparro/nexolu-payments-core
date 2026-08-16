@@ -1,114 +1,126 @@
-# Nexolu Payments Core
+# Nexolú Payments Core
 
-Pasarela de pagos unificada para todo el ecosistema Nexolu (POS, IA Core y lo
-que venga despues). No es "los pagos del POS": es un servicio Python/FastAPI
-independiente, agnostico de cual app lo llama, que cualquier producto puede
-usar sin acoplarse a el ni a los demas -- mismo espiritu que `nexolu-ia-core`.
+Servicio FastAPI de orquestación de pagos para las aplicaciones del ecosistema Nexolú y para aplicaciones de terceros.
 
-Hoy procesa pagos con **Wompi** (unico proveedor implementado), pero el resto
-del servicio programa contra una interfaz de proveedor (`providers/base.py`),
-no contra Wompi directamente: agregar otro proveedor manana es una clase
-nueva, no una reescritura.
+Wompi es el primer proveedor implementado. El Core programa contra `PaymentProvider`, por lo que proveedores futuros como Bold no deben requerir una reescritura del corazón del sistema.
 
-## Principios de arquitectura
+## Arquitectura
 
-- **El Core nunca toca la base de datos de negocio de ninguna app.** No sabe
-  que es una suscripcion, un plan o un negocio -- solo sabe de
-  transacciones, referencias y montos. Cada app integradora decide que
-  significa un pago aprobado para ella.
-- **Una API key por aplicacion, nunca por usuario final.** El Core no tiene
-  sesion de usuario propia: confia en que la app que lo llama (autenticada
-  con su API key) ya resolvio quien es su cliente.
-- **Cada integracion es dueña de sus propias credenciales de proveedor.**
-  Nada de un solo `WOMPI_PUBLIC_KEY` global en `.env` como hoy en
-  pos-saas-legacy: cada app puede tener su propio merchant account de Wompi,
-  configurable en base de datos, sin redeploy.
-- **La fuente de verdad de un pago es el webhook del proveedor, nunca el
-  navegador.** El resultado que el widget de Wompi devuelve en el cliente es
-  solo UX; la transaccion no se marca aprobada hasta que Wompi lo confirma
-  por su propio webhook, firmado.
-- **El Core nunca importa nada de una app especifica.** Agregar una app
-  integradora nueva es darla de alta en la base de datos (slug, API key,
-  webhook, credenciales de Wompi) -- no toca una linea de codigo.
+```text
+Merchant
+├── ProviderCredential
+│   └── Wompi
+├── Integration: POS
+└── Integration: Spa
 
-## Estructura
-
-```
-nexolu_payments_core/
-  main.py              FastAPI app factory
-  config.py             Settings (env vars): solo infraestructura, nunca credenciales de proveedor
-  core/
-    auth/                 Identidad de las integraciones (API key -> Integration)
-    memory/                Persistencia (SQLAlchemy async) + Alembic: integrations,
-                          provider_credentials, fee_schedules, transactions, webhook_deliveries
-    payments/              fees.py (comision por transaccion) + service.py (orquestador)
-    webhooks/               Firma y envio de las notificaciones salientes (Core -> app integradora)
-    security/               Cifrado en reposo de credenciales de proveedor (Fernet)
-    telemetry/              Logging JSON estructurado
-  providers/            Contrato agnostico de proveedor + implementacion de Wompi
-  api/v1/               Endpoints HTTP: payments (lo que la app CONSUME), webhooks (lo que Wompi llama)
-scripts/
-  register_integration.py  CLI para dar de alta/actualizar una integracion en BD
-tests/                 pytest (fees, firma de Wompi, flujo completo de pago via ASGI)
-alembic/               Migraciones de esquema
-docs/
-  APP_INTEGRATION.md    Guia de integracion para una app nueva
+Merchant: Colegio
+├── ProviderCredential
+│   └── Wompi
+└── Integration: Colegio
 ```
 
-## Como correr en local
+- **Merchant**: empresa propietaria de las cuentas de pago.
+- **Integration**: aplicación autorizada a consumir el Core.
+- **ProviderCredential**: credenciales cifradas del proveedor pertenecientes al Merchant.
+- **Transaction**: contexto completo de un pago, incluyendo `merchant_id` e `integration_id`.
+
+## API keys
+
+Payments Core genera automáticamente la API key y el webhook secret al crear una Integration. Una aplicación usa:
+
+```http
+Authorization: Bearer <integration-api-key>
+```
+
+La API key no debe escribirse en el código fuente del consumidor.
+
+## Provisioning
+
+La configuración inicial se realiza mediante endpoints protegidos por `PROVISIONING_KEY`.
+
+```http
+POST /v1/admin/merchants
+POST /v1/admin/merchants/{merchant_id}/integrations
+POST /v1/admin/merchants/{merchant_id}/providers/wompi
+```
+
+`PROVISIONING_KEY` es un secreto de servidor y nunca debe exponerse a un frontend público. El frontend administrativo futuro debe hablar con un backend autenticado que controle estas operaciones.
+
+## Payments
+
+Crear un intent:
+
+```http
+POST /v1/payments/intents
+Authorization: Bearer <integration-api-key>
+```
+
+La aplicación envía monto, cliente y metadata, pero **no genera la reference**.
+
+Payments Core genera una referencia como `pay_<unique-id>`, la persiste y la envía exactamente igual al proveedor.
+
+```json
+{
+  "amount_cop": 50000,
+  "currency": "COP",
+  "customer": {"email": "cliente@example.com"},
+  "metadata": {"order_id": "12345"},
+  "flow": "api"
+}
+```
+
+Respuesta conceptual:
+
+```json
+{
+  "transaction_id": "...",
+  "reference": "pay_...",
+  "provider": "wompi",
+  "status": "pending"
+}
+```
+
+## Webhook Wompi
+
+Todos los comercios pueden usar el mismo endpoint:
+
+```http
+POST /v1/webhooks/wompi
+```
+
+Wompi envía la `reference`. El Core encuentra la Transaction por el índice de `reference`, obtiene directamente `merchant_id` e `integration_id`, carga las credenciales Wompi del Merchant, valida la firma y actualiza el pago.
+
+No se necesita `/wompi/{integration_slug}`.
+
+## Webhook hacia la aplicación
+
+Después de procesar el evento del proveedor, Payments Core envía un evento normalizado a `Integration.webhook_url`, firmado con el `webhook_secret` de esa Integration.
+
+El payload es agnóstico del proveedor e incluye `transaction_id`, `reference`, `provider`, `provider_transaction_id`, monto, estado y metadata.
+
+## Seguridad
+
+Las credenciales privadas de proveedores se almacenan cifradas mediante Fernet. La clave maestra `PAYMENTS_MASTER_KEY` solo vive en el entorno del servicio.
+
+Nunca se devuelven private keys, integrity secrets o events secrets mediante endpoints de consulta.
+
+## Desarrollo
 
 ```bash
 uv venv .venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 cp .env.example .env
-# Generar y pegar PAYMENTS_MASTER_KEY en .env:
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-
-alembic upgrade head    # o dejar que arranque solo con SQLite (ver main.py)
+alembic upgrade head
 uvicorn nexolu_payments_core.main:app --reload
 ```
 
-## Dar de alta una integracion (app cliente)
-
-No hay panel de administracion todavia. Se hace con el script incluido, que
-crea/actualiza la integracion, sus credenciales de Wompi y su tarifa en la
-base de datos:
+Generar una Fernet key:
 
 ```bash
-python -c "import secrets; print(secrets.token_urlsafe(32))"  # generar api-key y webhook-secret
-
-python -m scripts.register_integration \
-    --slug pos-legacy --name "Nexolu POS" \
-    --api-key <api-key-generada> \
-    --webhook-url https://pos.nexolu.co/integrations/payments-core/webhook \
-    --webhook-secret <webhook-secret-generado> \
-    --wompi-public-key pub_prod_xxx --wompi-private-key prv_prod_xxx \
-    --wompi-integrity-secret xxx --wompi-events-secret xxx \
-    --environment production
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-El comando imprime la URL de webhook que hay que configurar en el dashboard
-de Wompi de esa integracion: `/v1/webhooks/wompi/<slug>`.
-
-## Probar el flujo completo
-
-```bash
-curl -X POST http://localhost:8000/v1/payments/intents \
-  -H "Authorization: Bearer <api-key-de-la-integracion>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "reference": "NEX-1-2026",
-    "amount_cop": 50000,
-    "redirect_url": "https://pos.nexolu.co/subscription/billing?paid=1",
-    "customer": {"email": "cliente@nexolu.co", "full_name": "Cliente Demo"}
-  }'
-```
-
-Devuelve los parametros para que el frontend de la app abra el widget de
-Wompi (`checkout.wompi.co/widget.js`) -- ver `docs/APP_INTEGRATION.md`
-seccion 2 para el snippet completo. Cuando Wompi confirma el pago, notifica
-al Core en `/v1/webhooks/wompi/<slug>`, y el Core reenvia el resultado ya
-normalizado (agnostico de Wompi) al `webhook_url` de la integracion.
+Definir también `PROVISIONING_KEY` en el entorno para usar los endpoints de provisioning.
 
 ## Tests
 
@@ -116,29 +128,21 @@ normalizado (agnostico de Wompi) al `webhook_url` de la integracion.
 pytest
 ```
 
-Cubren: calculo de comision (paridad con `WompiFees` del legacy, incluido el
-redondeo estilo PHP), verificacion de firma de Wompi (payload valido,
-manipulado, sin secreto), y el flujo de punta a punta via ASGI: crear un
-intent, simular el webhook de Wompi, verificar que la transaccion queda
-aprobada con su comision calculada y que el Core notifica a la app
-integradora con un webhook firmado.
+Los tests deben cubrir especialmente aislamiento por Merchant, generación de references, credenciales cifradas, firma de webhooks, idempotencia y routing de webhook por Transaction.
 
-## Extender el Core
+## Extensibilidad
 
-- **Agregar un proveedor de pago nuevo** (PayU, Stripe...): escribir una
-  clase que cumpla `PaymentProvider` (`providers/base.py`) en un modulo
-  nuevo de `providers/` y darla de alta en `providers/registry.py`. Nada
-  mas del Core cambia.
-- **Agregar una aplicacion nueva**: `python -m scripts.register_integration`
-  con sus propios slug/API key/webhook/credenciales de Wompi. El Core no
-  cambia.
-- **Trabajo futuro conocido** (documentado, no implementado): los
-  reintentos de webhook saliente son sincronos dentro del request del
-  webhook entrante (ver `core/webhooks/dispatcher.py`) -- una cola de
-  trabajo (Celery/RQ/arq) para reintentos en background y un endpoint de
-  "reenviar a mano" son el siguiente paso natural cuando el volumen lo
-  justifique. Tampoco hay reconciliacion activa contra la API REST de
-  Wompi (solo se confia en el webhook, igual que hoy pos-saas-legacy);
-  `GET /v1/payments/transactions/{reference}` cubre el caso de polling
-  desde el frontend, pero no hay un job que le pregunte a Wompi por
-  transacciones que se quedaron `pending` demasiado tiempo.
+```text
+Application
+    ↓
+Payments Core
+    ↓
+PaymentProvider
+├── Wompi
+├── Bold (future)
+└── other providers
+```
+
+Agregar un proveedor debe limitarse a implementar el contrato de `providers/base.py` y registrarlo en `providers/registry.py`.
+
+Consulta `docs/APP_INTEGRATION.md` y `docs/MULTI_MERCHANT_ARCHITECTURE.md` para los contratos actuales.

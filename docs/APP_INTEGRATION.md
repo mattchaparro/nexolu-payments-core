@@ -1,636 +1,200 @@
-# Integrar una aplicacion nueva al Nexolu Payments Core
+# Integrating an application with Nexolú Payments Core
 
-Guia de referencia para conectar una app (pos-saas-legacy, nexolu-pos-api,
-nexolu-ia-core o lo que venga) a la pasarela de pagos unificada. El Core
-nunca sabe que es una "suscripcion" o un "negocio": solo procesa
-transacciones con una `reference` que tu app genera y te notifica el
-resultado. Toda la logica de negocio (activar algo, mandar un correo, lo que
-sea) sigue siendo tuya.
+## 1. Concepts
 
-Hay dos formas de completar un cobro con tarjeta, elegidas con el campo
-`flow` al crear el intent (seccion 2). **Ambas terminan de la misma forma**:
-la fuente de verdad del resultado SIEMPRE es el webhook del Core (seccion
-3), nunca lo que devuelve el navegador ni la respuesta sincrona de ningun
-endpoint.
+A **Merchant** is the company that owns the payment-provider account.
 
-- **`flow: "api"` (recomendado, nuevo).** Tu app nunca sale de tu propia UI:
-  tu frontend tokeniza la tarjeta hablando directo con Wompi (nunca con el
-  Core) y tu backend confirma el cobro con `POST /intents/{reference}/charge`.
-  Ver seccion 2b.
-- **`flow: "widget"` (default, legado -- sigue funcionando igual que
-  siempre).** Tu frontend abre el widget hospedado por Wompi con los
-  parametros que te devuelve el Core. Ver seccion 2a. No hay fecha de
-  apagado todavia; si ya integraste este flujo no tienes que migrar.
+An **Integration** is an application that consumes Payments Core.
 
-Para exploracion interactiva, con el servicio corriendo local (`uvicorn
-nexolu_payments_core.main:app --reload`) el contrato completo, tipado, con
-ejemplos, esta siempre en `http://localhost:8000/docs` (Swagger UI) y
-`http://localhost:8000/redoc` -- esta guia es la version narrada del mismo
-contrato.
+A Merchant can have many Integrations and they share the Merchant's provider credentials.
 
-## 1. Arquitectura en una frase
-
-```
-flow="api" (recomendado):
-
-Usuario final → tu app → POST /v1/payments/intents {flow: "api"} (Core)
-                   ▲                                    │
-                   │                        Core pide a Wompi los tokens
-                   │                        de aceptacion legal (Wompi API)
-                   │                                    ▼
-       tu frontend tokeniza  ←──────────  respuesta con payment_init
-       la tarjeta DIRECTO con Wompi
-       (nunca con el Core / tu backend)
-                   │
-                   │ tu backend recibe el card token
-                   ▼
-       POST /v1/payments/intents/{reference}/charge (Core)
-                   │
-                   │              Core llama a Wompi API (POST /transactions)
-                   ▼                          │
-       ack inmediato (aun "pending")  ←───────┘
-                   │
-                   │  ... Wompi procesa async ...
-                   ▼
-          Wompi confirma  →  POST /v1/webhooks/wompi/<tu-slug> (Core)
-                                        │
-                          Core verifica firma, calcula tu comision,
-                          marca la transaccion aprobada/rechazada
-                                        │
-                                        ▼
-                        POST {tu webhook_url} (Core → tu app, FIRMADO)
-                                        │
-                          tu app activa lo que corresponda
-
-
-flow="widget" (legado, sigue funcionando):
-
-Usuario final → tu app → POST /v1/payments/intents (Core)
-                   ▲                    │
-                   │        Core arma el checkout de Wompi (local, sin red)
-                   │                    │
-          tu frontend abre              ▼
-          el widget de Wompi  ←── respuesta con checkout params
-                   │
-                   │ el usuario paga (Wompi, nunca tu app, ve la tarjeta)
-                   ▼
-          Wompi confirma  →  POST /v1/webhooks/wompi/<tu-slug> (Core)
-                                        │
-                          (mismo procesamiento de webhook que arriba)
+```text
+Merchant A
+├── Wompi
+├── POS Integration
+└── Spa Integration
 ```
 
-En ambos flujos, el Core nunca recibe el numero de tarjeta: en `api` porque
-tu frontend tokeniza directo con Wompi; en `widget` porque el que ve la
-tarjeta es el iframe de Wompi, nunca tu app ni el Core.
+A different company has a different Merchant and therefore different Wompi credentials.
 
-## 2. Que debes CONSUMIR de tu lado (iniciar un cobro)
+## 2. Provisioning
 
-### `POST /v1/payments/intents`
+Provisioning is performed by a trusted backend using the server-side `PROVISIONING_KEY`.
 
-Autenticado con tu API key: `Authorization: Bearer <tu api_key>`.
+### Create Merchant
+
+```http
+POST /v1/admin/merchants
+X-Payments-Provisioning-Key: <provisioning-key>
+Content-Type: application/json
+```
 
 ```json
 {
-  "reference": "NEX-42-20260806-AB12",
+  "name": "Colegio San X",
+  "slug": "colegio-san-x"
+}
+```
+
+### Create Integration
+
+```http
+POST /v1/admin/merchants/{merchant_id}/integrations
+X-Payments-Provisioning-Key: <provisioning-key>
+```
+
+```json
+{
+  "name": "Colegio App",
+  "slug": "colegio-app",
+  "environment": "production",
+  "webhook_url": "https://example.com/payments/webhook"
+}
+```
+
+Payments Core generates the Integration's `api_key` and `webhook_secret`. The credentials are returned only during creation and must be stored by the trusted application backend.
+
+### Configure Wompi
+
+```http
+POST /v1/admin/merchants/{merchant_id}/providers/wompi
+X-Payments-Provisioning-Key: <provisioning-key>
+```
+
+```json
+{
+  "environment": "production",
+  "public_key": "pub_prod_...",
+  "private_key": "prv_prod_...",
+  "integrity_secret": "...",
+  "events_secret": "..."
+}
+```
+
+Private provider secrets are encrypted with the Core's Fernet master key before being persisted.
+
+## 3. Creating a payment
+
+Applications authenticate with their Integration API key:
+
+```http
+Authorization: Bearer <integration-api-key>
+```
+
+Create an intent:
+
+```http
+POST /v1/payments/intents
+```
+
+```json
+{
   "amount_cop": 50000,
   "currency": "COP",
-  "redirect_url": "https://tu-app.com/billing?paid=1",
-  "customer": { "email": "cliente@correo.com", "full_name": "Nombre Cliente" },
-  "metadata": { "business_id": "42", "subscription_days": 30 },
+  "redirect_url": "https://example.com/payment/result",
+  "customer": {
+    "email": "customer@example.com"
+  },
+  "metadata": {
+    "order_id": "12345"
+  },
   "flow": "api"
 }
 ```
 
-- **`reference`**: la generas TU, unica dentro de tu integracion (igual que
-  hoy `SubscriptionController::wompiInitiate()` arma
-  `NEX-<business_id>-<timestamp>-<random>` en pos-saas-legacy). Es lo que
-  usas para conciliar tu propia orden con el resultado.
-- **`metadata`**: cualquier dato tuyo (ids internos, dias de suscripcion...)
-  que quieras recibir de vuelta tal cual en el webhook saliente. El Core no
-  la interpreta, solo la guarda y la reenvia.
-- **`flow`**: `"api"` o `"widget"` (default si se omite). Determina que
-  version de la respuesta te interesa -- ver 2a/2b. El campo `redirect_url`
-  sigue siendo obligatorio incluso con `flow: "api"` (se usa igual para el
-  checkout legado que el Core sigue calculando en paralelo, sin costo).
-
-Errores posibles (ambos flujos): `401` (API key invalida), `409` (ya existe
-una transaccion con esa `reference`), `503` (tu integracion no tiene
-credenciales de Wompi activas -- avisale a quien administra el Core), `502`
-(solo con `flow: "api"`: Wompi no respondio al pedir los tokens de
-aceptacion legal -- reintenta).
-
-### 2a. Widget Checkout (legado, `flow: "widget"` o sin `flow`)
-
-Respuesta (`201`):
+The application does **not** send a Wompi reference. Payments Core generates it and returns it:
 
 ```json
 {
-  "transaction_id": "a1b2c3...",
-  "reference": "NEX-42-20260806-AB12",
+  "transaction_id": "...",
+  "reference": "pay_...",
   "provider": "wompi",
   "status": "pending",
-  "checkout": {
-    "public_key": "pub_prod_xxx",
-    "amount_in_cents": 5000000,
-    "currency": "COP",
-    "reference": "NEX-42-20260806-AB12",
-    "integrity_signature": "...",
-    "redirect_url": "https://tu-app.com/billing?paid=1",
-    "customer_data": { "email": "cliente@correo.com", "full_name": "Nombre Cliente" }
-  }
+  "checkout": {},
+  "payment_init": {}
 }
 ```
 
-Tu frontend usa `checkout` tal cual para abrir el widget de Wompi -- **es el
-mismo widget que ya usa `Billing.vue` de pos-saas-legacy hoy**, la unica
-diferencia es que los parametros vienen del Core en vez de tu propio
-backend:
+The same Core-generated reference is sent to Wompi and stored in `transactions.reference`.
 
-```js
-const script = document.createElement('script');
-script.src = 'https://checkout.wompi.co/widget.js';
-document.head.appendChild(script);
-script.onload = () => {
-  const checkout = new window.WidgetCheckout({
-    currency: data.checkout.currency,
-    amountInCents: data.checkout.amount_in_cents,
-    reference: data.checkout.reference,
-    publicKey: data.checkout.public_key,
-    signature: { integrity: data.checkout.integrity_signature },
-    redirectUrl: data.checkout.redirect_url,
-    customerData: data.checkout.customer_data,
-  });
-  checkout.open((result) => { /* solo UX: la confirmacion real llega por tu webhook */ });
-};
+## 4. Direct API flow
+
+For `flow="api"`, the frontend may use the Wompi public information returned in `payment_init` to tokenize a card directly with Wompi. The card number must not be sent to Payments Core.
+
+Then call:
+
+```http
+POST /v1/payments/intents/{reference}/charge
+Authorization: Bearer <integration-api-key>
 ```
 
-### 2b. API directa (nuevo, `flow: "api"`)
+The final state is not inferred from the browser response. The provider webhook is the source of truth.
 
-Respuesta (`201`) -- trae ademas el bloque `payment_init`:
+## 5. Provider webhook
 
-```json
-{
-  "transaction_id": "a1b2c3...",
-  "reference": "NEX-42-20260806-AB12",
-  "provider": "wompi",
-  "status": "pending",
-  "checkout": { "...": "el legado sigue viniendo, por si lo necesitas de fallback" },
-  "payment_init": {
-    "public_key": "pub_prod_xxx",
-    "amount_in_cents": 5000000,
-    "currency": "COP",
-    "reference": "NEX-42-20260806-AB12",
-    "integrity_signature": "...",
-    "acceptance_token": "eyJhbGciOi...",
-    "accept_personal_auth": "eyJhbGciOi..."
-  }
-}
+Wompi is configured with one central URL:
+
+```http
+POST /v1/webhooks/wompi
 ```
 
-**Paso 1 -- tu frontend tokeniza la tarjeta DIRECTO con Wompi** (nunca con
-tu backend ni con el Core: el numero de tarjeta no debe tocar ninguno de
-los dos). Antes de tokenizar, muestrale al usuario los textos legales de
-`acceptance_token`/`accept_personal_auth` (Wompi exige un checkbox
-explicito de aceptacion -- ver "Acceptance tokens" en la documentacion de
-Wompi):
+Wompi includes the payment reference in the event. Payments Core finds the transaction directly by `reference`.
 
-```js
-const response = await fetch(`https://production.wompi.co/v1/tokens/cards`, {
-  method: 'POST',
-  headers: {
-    'Authorization': `Bearer ${data.payment_init.public_key}`,
-    'Content-Type': 'application/json',
-  },
-  body: JSON.stringify({
-    number: '4242424242424242',
-    cvc: '123',
-    exp_month: '12',
-    exp_year: '29',
-    card_holder: 'Nombre Cliente',
-  }),
-});
-const { data: { id: cardToken } } = await response.json();
-```
+The transaction already contains:
 
-(Usa `https://sandbox.wompi.co/v1/...` mientras pruebas con llaves
-`pub_test_...`/`prv_test_...`.)
+- `merchant_id`
+- `integration_id`
+- `provider_slug`
 
-**Paso 2 -- tu backend confirma el cobro con el Core**, mandandole el
-`cardToken` del paso anterior:
+Therefore the Core does not need an Integration slug in the Wompi URL and does not need to guess which Merchant owns the transaction.
 
-### `POST /v1/payments/intents/{reference}/charge`
+After verifying the Wompi signature with the Merchant's credential, the Core updates the transaction and sends a normalized event to the Integration's `webhook_url`.
 
-```json
-{
-  "payment_method": { "type": "CARD", "token": "tok_prod_...", "installments": 1 }
-}
-```
+## 6. Application webhook
 
-Respuesta (`200`):
-
-```json
-{
-  "transaction_id": "a1b2c3...",
-  "reference": "NEX-42-20260806-AB12",
-  "status": "pending",
-  "provider_transaction_id": "wompi-tx-id",
-  "provider_status": "PENDING"
-}
-```
-
-**`status` se queda en `"pending"` a proposito**, aunque `provider_status`
-ya diga `APPROVED`/`DECLINED`: es solo el ack inmediato de Wompi, no la
-confirmacion. La confirmacion real -- la que dispara tu webhook y calcula tu
-comision -- sigue llegando exclusivamente por
-`POST /v1/webhooks/wompi/<tu-slug>` (seccion 3), exactamente igual que en el
-flujo Widget. Usa `GET /v1/payments/transactions/{reference}` (abajo) para
-hacer polling de UX mientras esperas.
-
-Errores posibles: `404` (no hay una transaccion `pending` con esa
-`reference` -- el intent no se creo con `flow: "api"`, o ya se cobro antes),
-`503` (integracion sin credenciales activas), `502` (Wompi rechazo el
-intento de cobro -- p.ej. token invalido o expirado; la transaccion queda
-marcada `error` en el Core, no se queda "pending" para siempre esperando un
-webhook que nunca va a llegar porque Wompi nunca acepto la transaccion).
-
-### 2c. Otros metodos de pago (Nequi, PSE, Boton Bancolombia)
-
-`POST /intents/{reference}/charge` acepta el mismo `payment_method` de
-arriba con otros `type`. **A diferencia de CARD, estos tres son
-asincronos**: Wompi responde `PENDING` de inmediato y el usuario tiene que
-terminar el pago en otro lado (su app Nequi, o el sitio de su banco) antes
-de que llegue la confirmacion real por webhook -- ver seccion 3, la logica
-no cambia en nada.
-
-**`NEQUI`** -- el usuario recibe una notificacion push en su celular, no hay
-redirect:
-```json
-{ "payment_method": { "type": "NEQUI", "phone_number": "3107654321" } }
-```
-
-**`PSE`** -- el usuario termina el pago en el sitio de su banco. Antes de
-cobrar, consulta el banco elegido con `GET /v1/payments/pse/financial-institutions`
-(ver mas abajo):
-```json
-{
-  "payment_method": {
-    "type": "PSE",
-    "user_type": 0,
-    "user_legal_id_type": "CC",
-    "user_legal_id": "1099888777",
-    "financial_institution_code": "1",
-    "payment_description": "Pago a Tienda Wompi",
-    "customer_full_name": "Nombre Apellido",
-    "customer_phone_number": "3107654321"
-  }
-}
-```
-
-**`BANCOLOMBIA_TRANSFER`** -- el usuario termina el pago en el sitio de
-Bancolombia:
-```json
-{
-  "payment_method": {
-    "type": "BANCOLOMBIA_TRANSFER",
-    "payment_description": "Pago a Tienda Wompi",
-    "ecommerce_url": "https://tu-app.com/billing?paid=1"
-  }
-}
-```
-
-Para `PSE`/`BANCOLOMBIA_TRANSFER`, la respuesta del `charge` trae ademas
-`"redirect_url"`: a donde redirigir al usuario para que termine el pago. El
-Core espera unos segundos (con un polling corto interno a Wompi) antes de
-responder, para conseguirla -- puede venir en `null` si Wompi tarda mas de
-lo esperado; en ese caso, sigue esperando el webhook igual (`status` no
-depende de esto). Para `NEQUI`/`CARD`, `redirect_url` siempre es `null`.
-
-**Metodos de pago disponibles y bancos PSE** (consultalos al montar tu
-pantalla de checkout, no en cada cobro -- no dependen de un intent creado):
-
-```
-GET /v1/payments/payment-methods
-```
-```json
-{ "provider": "wompi", "accepted_payment_methods": ["CARD", "NEQUI", "PSE", "BANCOLOMBIA_TRANSFER"] }
-```
-Trae la interseccion entre lo que tu comercio de Wompi tiene habilitado
-(dashboard de Wompi) y lo que este Core sabe orquestar -- nunca vas a ver
-aca un metodo que `charge()` no pueda procesar. Usalo para decidir que
-botones mostrar en tu selector de metodo de pago.
-
-```
-GET /v1/payments/pse/financial-institutions
-```
-```json
-{ "financial_institutions": [{ "code": "1", "name": "Banco de Bogota" }, "..."] }
-```
-El `code` es lo que reenvias en `payment_method.financial_institution_code`.
-
-### 2d. Fuentes de pago -- guardar tarjeta/Nequi para reuso (pagos recurrentes reales)
-
-De los metodos de arriba, **solo tarjeta y Nequi** se pueden tokenizar para
-reuso genuino (sin que el usuario vuelva a intervenir en cada cobro) -- PSE
-y Boton Bancolombia siempre son de una sola vez, Wompi no ofrece
-"recordarlos". Esto es lo que Wompi llama "Fuentes de Pago", y es la base
-real de un cobro recurrente/automatico (ej. una suscripcion mensual).
-
-**Paso 1 -- tokeniza (tu frontend, directo a Wompi, llave publica)**, igual
-que ya haces para tarjeta (seccion 2b). Para Nequi es analogo:
-```js
-const r = await fetch(`https://{sandbox|production}.wompi.co/v1/tokens/nequi`, {
-  method: 'POST',
-  headers: { Authorization: `Bearer ${public_key}`, 'Content-Type': 'application/json' },
-  body: JSON.stringify({ phone_number: '3107654321' }),
-});
-const { data: { id: nequiToken, status } } = await r.json(); // status: "PENDING"
-```
-El usuario recibe un push en Nequi para aprobar la suscripcion (una unica
-vez). Haz polling directo a Wompi (llave publica, sin el Core) hasta
-`"APPROVED"`:
-```
-GET https://{env}.wompi.co/v1/tokens/nequi/{nequiToken}
-Authorization: Bearer {public_key}
-```
-**Validado en sandbox**: con el celular de prueba `3991111111`, el estado
-pasa a `APPROVED` casi de inmediato sin interaccion real (Wompi lo simula) --
-en produccion, en cambio, si hace falta que el usuario apruebe en su app.
-
-**Paso 2 -- crea la fuente de pago (tu backend → Core, NUNCA el frontend):**
-```
-POST /v1/payments/payment-sources
-{ "type": "CARD" | "NEQUI", "token": "<token del paso 1>", "customer_email": "..." }
-→ { "payment_source_id": "363489", "type": "CARD", "status": "AVAILABLE" }
-```
-Esto exige la llave PRIVADA del lado de Wompi -- por eso es un endpoint del
-Core (tu app nunca ve esa llave), a diferencia de la tokenizacion del Paso 1.
-
-**Paso 3 -- cobra reusando la fuente, todas las veces que haga falta:**
-```
-POST /intents/{reference}/charge
-{ "payment_method": { "type": "PAYMENT_SOURCE", "payment_source_id": "363489", "installments": 1 } }
-```
-**Validado en sandbox**: se cobro dos veces con el mismo `payment_source_id`
-sin volver a tokenizar nada -- esto es lo que demuestra que es un cobro
-genuinamente recurrente, no uno disfrazado. `installments` solo aplica si
-la fuente es tarjeta.
-
-**Cancelar una fuente guardada:**
-```
-PUT /v1/payments/payment-sources/{id}/void
-```
-⚠️ **Limitacion real de Wompi, confirmada en sandbox**: este endpoint
-devolvio `422` ("Únicamente se pueden anular fuentes de pago con el tipo de
-operación financiera 'PREAUTHORIZATION'") contra una fuente `AVAILABLE`
-normal creada como en el Paso 2. En la practica, no cuentes con poder
-"desactivar" una fuente de pago comun via Wompi -- si tu app necesita dejar
-de usarla, hazlo de tu lado (deja de ofrecerla/guardarla), no dependas de
-que Wompi la bloquee.
-
-### `GET /v1/payments/transactions/{reference}`
-
-Mismo uso en ambos flujos: tu frontend puede consultar esto mientras espera
-que tu webhook confirme, como fallback de UX si el webhook tarda (equivalente
-al polling que hoy hace `Billing.vue` contra `/subscription/status`).
-
-```json
-{
-  "transaction_id": "...", "reference": "NEX-42-20260806-AB12", "provider": "wompi",
-  "status": "approved", "amount_cop": 50000, "currency": "COP",
-  "fee_cop": 2410, "net_amount_cop": 47590,
-  "provider_transaction_id": "wompi-tx-id", "created_at": "...", "confirmed_at": "..."
-}
-```
-
-## 3. Que debes IMPLEMENTAR de tu lado (el webhook)
-
-Un unico endpoint tuyo, publico, que reciba `POST` del Core cuando una de
-tus transacciones cambia de estado -- **identico sin importar si la
-transaccion se origino con `flow: "widget"` o `flow: "api"`**:
+The application webhook is provider-agnostic and contains:
 
 ```json
 {
   "event": "payment.approved",
-  "integration": "pos-legacy",
-  "transaction_id": "a1b2c3...",
-  "reference": "NEX-42-20260806-AB12",
+  "integration": "nexolu-pos",
+  "transaction_id": "...",
+  "reference": "pay_...",
   "provider": "wompi",
-  "provider_transaction_id": "wompi-tx-id",
+  "provider_transaction_id": "...",
   "amount_cop": 50000,
   "currency": "COP",
-  "fee_cop": 2410,
-  "net_amount_cop": 47590,
+  "fee_cop": 2023,
+  "net_amount_cop": 47977,
   "status": "approved",
-  "occurred_at": "2026-08-06T12:00:00",
-  "metadata": { "business_id": "42", "subscription_days": 30 }
+  "metadata": {
+    "order_id": "12345"
+  }
 }
 ```
 
-`event` es uno de `payment.approved`, `payment.declined`, `payment.error`,
-`payment.voided`, `payment.pending` -- agnostico de que el proveedor por
-debajo sea Wompi (u otro, el dia que se agregue uno) y de si el pago se
-origino por Widget o por API directa. Tu logica de negocio programa contra
-este contrato, no contra el formato de Wompi.
+The callback is signed with the Integration's webhook secret.
 
-### Verificar la firma (obligatorio)
+## 7. Transaction lookup
 
-Cada request trae `X-Nexolu-Signature` y `X-Nexolu-Timestamp`. La firma es
-`HMAC-SHA256("{timestamp}.{body crudo}", tu_webhook_secret)` -- el
-`webhook_secret` que te dieron al registrar tu integracion. Verificarla
-**antes** de procesar nada, exactamente con el mismo espiritu que
-`WompiService::verifyWebhookSignature()` ya hace hoy con el webhook de
-Wompi:
-
-```php
-// Laravel / pos-saas-legacy
-public function handle(Request $request): JsonResponse
-{
-    $timestamp = $request->header('X-Nexolu-Timestamp');
-    $signature = $request->header('X-Nexolu-Signature');
-    $secret    = config('services.nexolu_payments_core.webhook_secret');
-
-    $expected = hash_hmac('sha256', $timestamp . '.' . $request->getContent(), $secret);
-
-    if (! hash_equals($expected, (string) $signature)) {
-        return response()->json(['error' => 'invalid_signature'], 401);
-    }
-
-    $payload = $request->json()->all();
-    // $payload['reference'] es TU reference: buscar tu orden por ahi,
-    // igual que hoy SubscriptionCheckoutOrder::where('order_key', $reference).
-    // ...
-
-    return response()->json(['ok' => true]);
-}
+```http
+GET /v1/payments/transactions/{reference}
+Authorization: Bearer <integration-api-key>
 ```
 
-```python
-# Python / FastAPI (ver core/webhooks/signing.py del Core, misma logica)
-import hashlib, hmac
+The application can poll this endpoint while waiting for the provider webhook.
 
-def verify(secret: str, raw_body: bytes, timestamp: str, signature: str) -> bool:
-    expected = hmac.new(secret.encode(), f"{timestamp}.".encode() + raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
+## 8. Provider abstraction
+
+Wompi is the first `PaymentProvider`. The Core architecture must not require application changes when adding another provider such as Bold.
+
+```text
+Application
+    ↓
+Payments Core
+    ↓
+PaymentProvider
+    ├── Wompi
+    ├── Bold (future)
+    └── other providers
 ```
-
-### Idempotencia
-
-El Core reintenta hasta 3 veces (inmediato, +1s, +2s) si tu endpoint no
-responde `2xx`. Tu handler debe ser idempotente: si te llega el mismo
-`transaction_id`/`reference` dos veces, la segunda vez no debe volver a
-activar/cobrar nada -- solo responder `200` (igual que
-`WompiWebhookController::activateSubscription()` ya chequea
-`status === 'pending'` antes de procesar).
-
-### Responder rapido
-
-Responde `2xx` en cuanto verificaste la firma y encolaste/guardaste el
-evento -- no hagas trabajo pesado (mandar emails, etc.) sincrono dentro del
-webhook si se puede evitar. El Core espera con un timeout corto.
-
-## 4. Configurar tu integracion
-
-No hay panel de administracion todavia: quien administra el Core corre
-
-```bash
-python -m scripts.register_integration \
-    --slug <tu-slug> --name "<Tu App>" \
-    --api-key <api-key-que-vas-a-usar> \
-    --webhook-url https://tu-app.com/tu-endpoint-de-webhook \
-    --webhook-secret <secreto-para-verificar-la-firma> \
-    --wompi-public-key ... --wompi-private-key ... \
-    --wompi-integrity-secret ... --wompi-events-secret ... \
-    --environment production
-```
-
-Esto crea/actualiza tu fila en `integrations` + tus credenciales de Wompi en
-`provider_credentials` + tu tarifa por defecto en `fee_schedules`
-(2.65% + 700 COP fijo + 19% IVA, iguales defaults que `WompiFees` del
-legacy -- pedile a quien administra el Core que la ajuste si tu tarifa
-negociada con Wompi es distinta). El comando imprime la URL que debes cargar
-en el dashboard de Wompi de tu merchant account: `/v1/webhooks/wompi/<tu-slug>`.
-
-`--environment` (`sandbox`/`production`) solo se usa para versionar tus
-credenciales dentro del Core -- el proveedor mismo elige el ambiente de
-Wompi (`sandbox.wompi.co` vs `production.wompi.co`) leyendo el prefijo de
-tus propias llaves (`pub_test_`/`prv_test_` vs `pub_prod_`/`prv_prod_`), asi
-que no hay nada adicional que configurar para usar `flow: "api"`.
-
-Guarda tu `api_key` y `webhook_secret` como secretos de tu propia app (en tu
-`.env`, nunca en el repo) -- son lo que te identifica ante el Core y lo que
-usas para verificar que un webhook realmente vino del Core.
-
-## 5. Checklist para integrar una app nueva
-
-1. Pedir que te registren con `scripts/register_integration.py` (slug, API
-   key, webhook URL/secret, credenciales de Wompi de tu propio merchant
-   account).
-2. Implementar tu endpoint de webhook: verificar firma (seccion 3), resolver
-   tu propia orden por `reference`, ser idempotente, responder rapido.
-3. En tu flujo de checkout, elegir un `flow`:
-   - `api` (recomendado): `POST /intents {flow: "api"}` → tu frontend
-     tokeniza contra Wompi con `payment_init.public_key` → `POST
-     /intents/{reference}/charge` con el token (seccion 2b).
-   - `widget` (legado): `POST /intents` → abrir el widget de Wompi con
-     `checkout` (seccion 2a).
-4. Opcional: usar `GET /v1/payments/transactions/{reference}` para polling
-   de UX mientras esperas tu webhook.
-5. Probar de punta a punta con las credenciales de **sandbox** de Wompi
-   (`pub_test_...`/`prv_test_...`) antes de pasar a `--environment production`.
-
-`core/` del Core no cambia en ningun paso de esta lista.
-
-## 6. Trabajo futuro conocido
-
-- No hay todavia un endpoint de reconciliacion activa contra
-  `GET /transactions/{id}` de Wompi (ver README, "Extender el Core") --
-  si una transaccion se queda `pending` mucho tiempo despues de un `charge`
-  exitoso (ack inmediato recibido pero el webhook nunca llega), hoy no hay
-  un job que le pregunte a Wompi por su estado real.
-- `flow: "api"` soporta `CARD`, `NEQUI`, `PSE` y `BANCOLOMBIA_TRANSFER`
-  (seccion 2c). Otros metodos que Wompi soporta (DAVIPLATA, BANCOLOMBIA_QR,
-  BNPL, SU+ Pay, pago en efectivo en corresponsales) no estan implementados
-  todavia -- usa `flow: "widget"` para esos por ahora. `GET
-  /v1/payments/payment-methods` siempre refleja la lista real soportada, no
-  hace falta memorizar esta.
-
-## 7. Validacion de `flow: "api"` (2026-08-14)
-
-- **Suite automatizada**: `pytest -v` -- 29/29 pasan, incluidos los tests
-  nuevos de `build_payment_init`/`charge` (`tests/test_wompi_provider.py`,
-  con `httpx_mock`) y del flujo completo (`tests/test_payments_flow.py`,
-  `test_create_intent_flow_api_*` / `test_charge_intent_*`).
-- **Extremo a extremo contra Wompi sandbox real** (no mocks), con
-  `scripts/test_direct_api_flow.py`, servidor local + tunel publico
-  (cloudflared) recibiendo el webhook real de Wompi en
-  `/v1/webhooks/wompi/<slug>`:
-  - Tarjeta `4242...` (aprobada): `POST /intents {flow: "api"}` devolvio
-    `payment_init` con tokens de aceptacion reales; tokenizacion directa
-    contra `sandbox.wompi.co` OK; `POST /intents/{reference}/charge` devolvio
-    ack inmediato (`provider_status: "PENDING"`, `status` local
-    `"pending"`); el webhook real de Wompi llego y la transaccion paso a
-    `status: "approved"` con `fee_cop`/`net_amount_cop` calculados
-    correctamente (mismos parametros de tarifa que el flujo Widget).
-  - Tarjeta `4111...` (declinada): mismo flujo, la transaccion termino en
-    `status: "declined"` con `fee_cop`/`net_amount_cop` en `null` (no se
-    cobra comision sobre transacciones declinadas).
-- Con esto quedan verificados de punta a punta: la firma de integridad, la
-  obtencion de tokens de aceptacion legal, la creacion de la transaccion en
-  Wompi con tarjeta tokenizada, la verificacion de firma del webhook
-  entrante, y el calculo de comision -- todo igual que en el flujo Widget,
-  como establece la seccion 1.
-
-## 8. Validacion de Nequi / PSE / Boton Bancolombia (2026-08-15)
-
-- **Suite automatizada**: `pytest -v` -- 42/42 pasan, incluidos los tests
-  nuevos de `charge()` por metodo (con `httpx_mock`, incluido el polling de
-  `redirect_url` acotado) y de `GET /payment-methods` /
-  `GET /pse/financial-institutions`.
-- **Contra Wompi sandbox real** (`scripts/test_direct_api_flow.py --payment-method {nequi,pse,bancolombia_transfer}`),
-  con el comercio sandbox real (11 metodos habilitados en Wompi, filtrados a
-  4 por `GET /payment-methods`):
-  - `NEQUI` (celular `3991111111`): `charge()` devolvio ack `PENDING`,
-    `redirect_url: null` (correcto, es push notification, no redirect).
-  - `PSE`: `GET /pse/financial-institutions` devolvio los 3 bancos de
-    prueba reales de Wompi; `charge()` con el banco `"1"` devolvio un
-    `redirect_url` real de Wompi (`api-sandbox.wompi.co/v1/pse/redirect?...`),
-    extraido por el polling interno sin tener que alargar el tope de 8
-    intentos -- aparecio dentro del primer intento en la practica.
-  - `BANCOLOMBIA_TRANSFER`: **la doc de Wompi no fue suficiente** -- el
-    primer intento devolvio `422` (`user_type: "No esta presente. Debe ser
-    uno de estos: PERSON"`), un campo que el ejemplo principal de
-    docs.wompi.co no muestra (si aparece en un ejemplo mas abajo en la misma
-    pagina, para "segundo medio de pago"). Se agrego `"user_type": "PERSON"`
-    fijo en `_payment_method_payload` (`providers/wompi.py`) y quedo
-    validado con un `redirect_url` real tras el fix.
-- No se repitio el webhook real de punta a punta (tunel + dashboard de
-  Wompi) para estos tres metodos porque el procesamiento del webhook
-  entrante es agnostico del metodo de pago (confirmado leyendo
-  `parse_webhook_event`/`verify_webhook_signature`, no miran `payment_method`)
-  y ya quedo validado con tarjeta en la seccion 7 -- lo nuevo aca (el
-  `payment_method` correcto por tipo, y el polling de `redirect_url`) si se
-  validó contra la API real de Wompi, no solo con mocks.
-
-## 9. Validacion de Fuentes de Pago (2026-08-15)
-
-- **Suite automatizada**: `pytest -v` -- 51/51 pasan, incluidos los tests
-  nuevos de `create_payment_source`/`void_payment_source`/`charge()` con
-  `PaymentSourceChargeMethod`.
-- **Contra Wompi sandbox real**: tokenizacion de tarjeta (llave publica) →
-  `POST /payment-sources` (llave privada) → **dos cobros con el MISMO
-  `payment_source_id`, sin volver a tokenizar** -- esto es lo que demuestra
-  que el reuso es real, no solo que el endpoint responde `200`. Tambien se
-  probo con Nequi: `POST /tokens/nequi` con el celular de prueba
-  `3991111111` pasa a `APPROVED` casi de inmediato en sandbox (sin
-  interaccion real necesaria ahi, a diferencia de produccion), y la fuente
-  de pago resultante tambien se cobro exitosamente.
-- **Limitacion real encontrada**: `PUT /payment-sources/{id}/void` devolvio
-  un error real de Wompi contra una fuente `AVAILABLE` normal --
-  "Únicamente se pueden anular fuentes de pago con el tipo de operación
-  financiera 'PREAUTHORIZATION'". El endpoint del Core esta bien
-  implementado (llega a Wompi, maneja el error correctamente como
-  `ProviderRequestError` → `502`), pero **no asumas que sirve para
-  "eliminar" una fuente de pago comun** -- documentado en sección 2d para
-  que quien construya el lado del negocio (`nexolu-pos-api`) no dependa de
-  esto para su UX de "eliminar método guardado" (ahi la solucion es un
-  soft-delete de su lado, no depender de que Wompi bloquee la fuente).
