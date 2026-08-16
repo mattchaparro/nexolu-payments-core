@@ -1,14 +1,4 @@
-"""Persistence models for Nexolu Payments Core.
-
-Ownership model:
-    Merchant -> provider credentials
-    Merchant -> integrations (applications)
-    Transaction -> merchant + integration snapshot
-
-The transaction deliberately stores merchant_id and integration_id directly so
-provider webhooks can resolve the payment context with one indexed lookup by
-reference.
-"""
+"""Persistence models for Nexolu Payments Core."""
 from __future__ import annotations
 
 import uuid
@@ -30,49 +20,36 @@ def _secret(prefix: str) -> str:
 
 
 class Merchant(Base):
-    """Empresa/comercio propietario de las cuentas de pago."""
-
     __tablename__ = "merchants"
-
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     slug: Mapped[str] = mapped_column(String(64), unique=True)
     name: Mapped[str] = mapped_column(String(128))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
     integrations: Mapped[list[Integration]] = relationship(back_populates="merchant")
     provider_credentials: Mapped[list[ProviderCredential]] = relationship(back_populates="merchant")
     fee_schedules: Mapped[list[FeeSchedule]] = relationship(back_populates="merchant")
 
 
 class Integration(Base):
-    """Aplicacion cliente autorizada a consumir Payments Core."""
-
     __tablename__ = "integrations"
-
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     merchant_id: Mapped[str] = mapped_column(ForeignKey("merchants.id"), index=True)
     slug: Mapped[str] = mapped_column(String(64), unique=True)
     name: Mapped[str] = mapped_column(String(128))
     environment: Mapped[str] = mapped_column(String(16), default="sandbox")
-    api_key: Mapped[str] = mapped_column(String(96), unique=True, default=lambda: _secret("nxl"))
+    api_key_hash: Mapped[str] = mapped_column(String(64), unique=True)
     webhook_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     webhook_secret: Mapped[str] = mapped_column(EncryptedString(255), default=lambda: _secret("whsec"))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
     merchant: Mapped[Merchant] = relationship(back_populates="integrations")
     fee_schedules: Mapped[list[FeeSchedule]] = relationship(back_populates="integration")
 
 
 class ProviderCredential(Base):
-    """Credenciales de proveedor pertenecientes al Merchant, por entorno."""
-
     __tablename__ = "provider_credentials"
-    __table_args__ = (
-        UniqueConstraint("merchant_id", "provider_slug", "environment", name="uq_credential_merchant_provider_env"),
-    )
-
+    __table_args__ = (UniqueConstraint("merchant_id", "provider_slug", "environment", name="uq_credential_merchant_provider_env"),)
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     merchant_id: Mapped[str] = mapped_column(ForeignKey("merchants.id"), index=True)
     provider_slug: Mapped[str] = mapped_column(String(32), default="wompi")
@@ -83,16 +60,12 @@ class ProviderCredential(Base):
     events_secret: Mapped[str] = mapped_column(EncryptedString(255))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
     merchant: Mapped[Merchant] = relationship(back_populates="provider_credentials")
 
 
 class FeeSchedule(Base):
-    """Comision versionada por Merchant y proveedor."""
-
     __tablename__ = "fee_schedules"
     __table_args__ = (Index("ix_fee_schedules_merchant", "merchant_id", "provider_slug", "is_active"),)
-
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     merchant_id: Mapped[str] = mapped_column(ForeignKey("merchants.id"), index=True)
     integration_id: Mapped[str | None] = mapped_column(ForeignKey("integrations.id"), nullable=True, index=True)
@@ -102,19 +75,11 @@ class FeeSchedule(Base):
     iva_percent: Mapped[float] = mapped_column(Float, default=19.0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     effective_from: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
     merchant: Mapped[Merchant] = relationship(back_populates="fee_schedules")
     integration: Mapped[Integration | None] = relationship(back_populates="fee_schedules")
 
 
 class Transaction(Base):
-    """Registro central del pago.
-
-    `reference` la genera el Core y es globalmente unica. merchant_id e
-    integration_id son snapshots deliberadamente redundantes para resolver
-    webhooks y consultas sin depender de la cadena de relaciones.
-    """
-
     __tablename__ = "transactions"
     __table_args__ = (
         UniqueConstraint("reference", name="uq_transaction_reference"),
@@ -122,7 +87,6 @@ class Transaction(Base):
         Index("ix_transactions_merchant_status", "merchant_id", "status"),
         Index("ix_transactions_integration_status", "integration_id", "status"),
     )
-
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     merchant_id: Mapped[str] = mapped_column(ForeignKey("merchants.id"), index=True)
     integration_id: Mapped[str] = mapped_column(ForeignKey("integrations.id"), index=True)
@@ -143,11 +107,8 @@ class Transaction(Base):
 
 
 class WebhookDelivery(Base):
-    """Auditoria y reintentos de eventos enviados a una Integration."""
-
     __tablename__ = "webhook_deliveries"
     __table_args__ = (Index("ix_webhook_deliveries_transaction", "transaction_id"),)
-
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     transaction_id: Mapped[str] = mapped_column(ForeignKey("transactions.id"))
     integration_id: Mapped[str] = mapped_column(ForeignKey("integrations.id"))
