@@ -206,6 +206,13 @@ class WompiCredentialsIn(BaseModel):
     events_secret: str
 
 
+@provisioning_router.get("/merchants", summary="List merchants")
+async def list_merchants(x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    _require_provisioning_key(x_payments_provisioning_key)
+    merchants = await repository.list_merchants(session)
+    return {"merchants": [{"id": m.id, "name": m.name, "slug": m.slug, "is_active": m.is_active} for m in merchants]}
+
+
 @provisioning_router.post("/merchants", status_code=201, summary="Create a merchant")
 async def create_merchant(body: MerchantIn, x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     _require_provisioning_key(x_payments_provisioning_key)
@@ -240,6 +247,28 @@ async def create_integration(merchant_id: str, body: IntegrationIn, x_payments_p
     await session.flush()
     await session.commit()
     return {"id": integration.id, "merchant_id": integration.merchant_id, "name": integration.name, "slug": integration.slug, "environment": integration.environment, "widget_enabled": integration.widget_enabled, "api_key": integration.api_key, "webhook_secret": integration.webhook_secret}
+
+
+@provisioning_router.get("/merchants/{merchant_id}/integrations", summary="List integrations for a merchant")
+async def list_integrations(merchant_id: str, x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    _require_provisioning_key(x_payments_provisioning_key)
+    merchant = await repository.get_merchant_by_id(session, merchant_id)
+    if merchant is None:
+        raise HTTPException(status_code=404, detail="Merchant no encontrado.")
+    integrations = await repository.list_integrations_by_merchant(session, merchant_id)
+    return {"integrations": [{"id": i.id, "merchant_id": i.merchant_id, "name": i.name, "slug": i.slug, "environment": i.environment, "webhook_url": i.webhook_url, "widget_enabled": i.widget_enabled, "is_active": i.is_active} for i in integrations]}
+
+
+@provisioning_router.get("/merchants/{merchant_id}/integrations/{integration_id}", summary="Get an integration")
+async def get_integration(merchant_id: str, integration_id: str, x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    # api_key/webhook_secret nunca se re-exponen aca (solo en la respuesta
+    # de create_integration, una unica vez) - mismo criterio que
+    # get_wompi_status con private_key/integrity_secret/events_secret.
+    _require_provisioning_key(x_payments_provisioning_key)
+    integration = await repository.get_integration_by_id(session, integration_id)
+    if integration is None or integration.merchant_id != merchant_id:
+        raise HTTPException(status_code=404, detail="Integration no encontrada.")
+    return {"id": integration.id, "merchant_id": integration.merchant_id, "name": integration.name, "slug": integration.slug, "environment": integration.environment, "webhook_url": integration.webhook_url, "widget_enabled": integration.widget_enabled, "is_active": integration.is_active}
 
 
 @provisioning_router.patch("/merchants/{merchant_id}/integrations/{integration_id}", summary="Update an integration")

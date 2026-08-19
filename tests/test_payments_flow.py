@@ -73,6 +73,52 @@ async def test_integration_widget_enabled_defaults_off_and_is_patchable(client, 
     assert patched.json()["widget_enabled"] is True
 
 
+async def test_list_merchants(client, monkeypatch):
+    monkeypatch.setenv("PROVISIONING_KEY", "provisioning-test-key")
+    from nexolu_payments_core.config import get_settings
+    get_settings.cache_clear()
+    headers = {"X-Payments-Provisioning-Key": "provisioning-test-key"}
+
+    await client.post("/v1/admin/merchants", headers=headers, json={"name": "Merchant C", "slug": "merchant-c"})
+    await client.post("/v1/admin/merchants", headers=headers, json={"name": "Merchant D", "slug": "merchant-d"})
+
+    response = await client.get("/v1/admin/merchants", headers=headers)
+    assert response.status_code == 200
+    slugs = {m["slug"] for m in response.json()["merchants"]}
+    assert {"merchant-c", "merchant-d"} <= slugs
+
+
+async def test_list_and_get_integration_never_expose_api_key(client, monkeypatch):
+    monkeypatch.setenv("PROVISIONING_KEY", "provisioning-test-key")
+    from nexolu_payments_core.config import get_settings
+    get_settings.cache_clear()
+    headers = {"X-Payments-Provisioning-Key": "provisioning-test-key"}
+
+    merchant = (await client.post("/v1/admin/merchants", headers=headers, json={"name": "Merchant E", "slug": "merchant-e"})).json()
+    created = (
+        await client.post(
+            f"/v1/admin/merchants/{merchant['id']}/integrations",
+            headers=headers,
+            json={"name": "App E", "slug": "app-e"},
+        )
+    ).json()
+    assert "api_key" in created
+
+    listed = await client.get(f"/v1/admin/merchants/{merchant['id']}/integrations", headers=headers)
+    assert listed.status_code == 200
+    [integration] = listed.json()["integrations"]
+    assert integration["id"] == created["id"]
+    assert "api_key" not in integration
+    assert "webhook_secret" not in integration
+
+    fetched = await client.get(
+        f"/v1/admin/merchants/{merchant['id']}/integrations/{created['id']}", headers=headers
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()["id"] == created["id"]
+    assert "api_key" not in fetched.json()
+
+
 async def test_models_have_merchant_context():
     from nexolu_payments_core.core.memory.entities import Integration, ProviderCredential, Transaction
 

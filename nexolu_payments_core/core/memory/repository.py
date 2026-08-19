@@ -16,6 +16,11 @@ async def get_merchant_by_slug(session: AsyncSession, slug: str) -> Merchant | N
     return (await session.execute(select(Merchant).where(Merchant.slug == slug))).scalar_one_or_none()
 
 
+async def list_merchants(session: AsyncSession) -> list[Merchant]:
+    stmt = select(Merchant).order_by(Merchant.created_at.desc())
+    return list((await session.execute(stmt)).scalars().all())
+
+
 async def get_integration_by_api_key(session: AsyncSession, api_key: str) -> Integration | None:
     stmt = select(Integration).join(Merchant, Merchant.id == Integration.merchant_id).where(
         Integration.api_key_hash == hash_api_key(api_key),
@@ -31,6 +36,11 @@ async def get_integration_by_id(session: AsyncSession, integration_id: str) -> I
 
 async def get_integration_by_slug(session: AsyncSession, slug: str) -> Integration | None:
     return (await session.execute(select(Integration).where(Integration.slug == slug, Integration.is_active.is_(True)))).scalar_one_or_none()
+
+
+async def list_integrations_by_merchant(session: AsyncSession, merchant_id: str) -> list[Integration]:
+    stmt = select(Integration).where(Integration.merchant_id == merchant_id).order_by(Integration.created_at.desc())
+    return list((await session.execute(stmt)).scalars().all())
 
 
 async def get_active_credential(session: AsyncSession, merchant_id: str, provider_slug: str, environment: str = "sandbox") -> ProviderCredential | None:
