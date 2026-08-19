@@ -48,6 +48,31 @@ async def test_provisioning_creates_merchant(client, monkeypatch):
     assert response.json()["slug"] == "merchant-a"
 
 
+async def test_integration_widget_enabled_defaults_off_and_is_patchable(client, monkeypatch):
+    monkeypatch.setenv("PROVISIONING_KEY", "provisioning-test-key")
+    from nexolu_payments_core.config import get_settings
+    get_settings.cache_clear()
+    headers = {"X-Payments-Provisioning-Key": "provisioning-test-key"}
+
+    merchant = (await client.post("/v1/admin/merchants", headers=headers, json={"name": "Merchant B", "slug": "merchant-b"})).json()
+
+    created = await client.post(
+        f"/v1/admin/merchants/{merchant['id']}/integrations",
+        headers=headers,
+        json={"name": "App B", "slug": "app-b"},
+    )
+    assert created.status_code == 201
+    assert created.json()["widget_enabled"] is False
+
+    patched = await client.patch(
+        f"/v1/admin/merchants/{merchant['id']}/integrations/{created.json()['id']}",
+        headers=headers,
+        json={"widget_enabled": True},
+    )
+    assert patched.status_code == 200
+    assert patched.json()["widget_enabled"] is True
+
+
 async def test_models_have_merchant_context():
     from nexolu_payments_core.core.memory.entities import Integration, ProviderCredential, Transaction
 

@@ -135,7 +135,7 @@ async def list_payment_methods(integration: Integration = Depends(get_current_in
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ProviderRequestError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return {"provider": "wompi", "accepted_payment_methods": methods}
+    return {"provider": "wompi", "accepted_payment_methods": methods, "widget_enabled": integration.widget_enabled}
 
 
 @router.get("/payments/pse/financial-institutions", summary="PSE financial institutions")
@@ -189,6 +189,13 @@ class IntegrationIn(BaseModel):
     slug: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$")
     environment: str = Field(default="sandbox", pattern=r"^(sandbox|production)$")
     webhook_url: str | None = None
+    widget_enabled: bool = False
+
+
+class IntegrationUpdateIn(BaseModel):
+    widget_enabled: bool | None = None
+    webhook_url: str | None = None
+    is_active: bool | None = None
 
 
 class WompiCredentialsIn(BaseModel):
@@ -228,11 +235,23 @@ async def create_integration(merchant_id: str, body: IntegrationIn, x_payments_p
         raise HTTPException(status_code=404, detail="Merchant no encontrado.")
     if await repository.get_integration_by_slug(session, body.slug):
         raise HTTPException(status_code=409, detail="La integration ya existe.")
-    integration = Integration(merchant_id=merchant.id, name=body.name, slug=body.slug, environment=body.environment, webhook_url=body.webhook_url)
+    integration = Integration(merchant_id=merchant.id, name=body.name, slug=body.slug, environment=body.environment, webhook_url=body.webhook_url, widget_enabled=body.widget_enabled)
     session.add(integration)
     await session.flush()
     await session.commit()
-    return {"id": integration.id, "merchant_id": integration.merchant_id, "name": integration.name, "slug": integration.slug, "environment": integration.environment, "api_key": integration.api_key, "webhook_secret": integration.webhook_secret}
+    return {"id": integration.id, "merchant_id": integration.merchant_id, "name": integration.name, "slug": integration.slug, "environment": integration.environment, "widget_enabled": integration.widget_enabled, "api_key": integration.api_key, "webhook_secret": integration.webhook_secret}
+
+
+@provisioning_router.patch("/merchants/{merchant_id}/integrations/{integration_id}", summary="Update an integration")
+async def update_integration(merchant_id: str, integration_id: str, body: IntegrationUpdateIn, x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    _require_provisioning_key(x_payments_provisioning_key)
+    integration = await repository.get_integration_by_id(session, integration_id)
+    if integration is None or integration.merchant_id != merchant_id:
+        raise HTTPException(status_code=404, detail="Integration no encontrada.")
+    for field, value in body.model_dump(exclude_unset=True).items():
+        setattr(integration, field, value)
+    await session.commit()
+    return {"id": integration.id, "merchant_id": integration.merchant_id, "name": integration.name, "slug": integration.slug, "environment": integration.environment, "webhook_url": integration.webhook_url, "widget_enabled": integration.widget_enabled, "is_active": integration.is_active}
 
 
 @provisioning_router.post("/merchants/{merchant_id}/providers/wompi", status_code=201, summary="Configure Wompi credentials")

@@ -44,6 +44,12 @@ class Integration(Base):
     webhook_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     webhook_secret: Mapped[str] = mapped_column(EncryptedString(255), default=lambda: _secret("whsec"))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Prende/apaga el flow="widget" (checkout.wompi.co/widget.js embebido)
+    # para esta Integration, sin tocar flow="api" (tokenizacion/PSE/Nequi/
+    # Boton Bancolombia directos). Se controla via provisioning
+    # (PATCH /v1/admin/merchants/{id}/integrations/{id}) y se expone a la
+    # app en GET /v1/payments/payment-methods - arranca apagado.
+    widget_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     merchant: Mapped[Merchant] = relationship(back_populates="integrations")
     fee_schedules: Mapped[list[FeeSchedule]] = relationship(back_populates="integration")
