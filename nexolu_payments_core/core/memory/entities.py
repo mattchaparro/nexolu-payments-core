@@ -99,7 +99,7 @@ class Transaction(Base):
     merchant_id: Mapped[str] = mapped_column(ForeignKey("merchants.id"), index=True)
     integration_id: Mapped[str] = mapped_column(ForeignKey("integrations.id"), index=True)
     provider_slug: Mapped[str] = mapped_column(String(32))
-    reference: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    reference: Mapped[str] = mapped_column(String(128), unique=True)
     provider_transaction_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     amount_cop: Mapped[int] = mapped_column(Integer)
     currency: Mapped[str] = mapped_column(String(8), default="COP")
