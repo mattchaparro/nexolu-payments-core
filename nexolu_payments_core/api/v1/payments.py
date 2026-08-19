@@ -246,7 +246,7 @@ async def create_integration(merchant_id: str, body: IntegrationIn, x_payments_p
     session.add(integration)
     await session.flush()
     await session.commit()
-    return {"id": integration.id, "merchant_id": integration.merchant_id, "name": integration.name, "slug": integration.slug, "environment": integration.environment, "widget_enabled": integration.widget_enabled, "api_key": integration.api_key, "webhook_secret": integration.webhook_secret}
+    return {"id": integration.id, "merchant_id": integration.merchant_id, "name": integration.name, "slug": integration.slug, "environment": integration.environment, "webhook_url": integration.webhook_url, "widget_enabled": integration.widget_enabled, "is_active": integration.is_active, "api_key": integration.api_key, "webhook_secret": integration.webhook_secret}
 
 
 @provisioning_router.get("/merchants/{merchant_id}/integrations", summary="List integrations for a merchant")
