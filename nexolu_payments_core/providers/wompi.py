@@ -299,6 +299,7 @@ class WompiProvider:
         customer_email: str,
         credentials: ProviderCredentialsData,
         payment_method: PaymentMethodInput,
+        redirect_url: str | None = None,
     ) -> ChargeResult:
         amount_in_cents = amount_cop * 100
         signature = self._integrity_signature(reference, amount_in_cents, currency, credentials.integrity_secret)
@@ -324,6 +325,11 @@ class WompiProvider:
             }
             if accept_personal_auth:
                 body["accept_personal_auth"] = accept_personal_auth
+            if redirect_url:
+                # Sin esto, Wompi/el banco no sabe a donde volver despues de
+                # PSE o Boton Bancolombia -- el usuario queda varado en el
+                # sitio del banco sin boton de "volver al comercio".
+                body["redirect_url"] = redirect_url
 
             if isinstance(payment_method, PaymentSourceChargeMethod):
                 # Forma distinta a los demas: payment_source_id va HERMANO

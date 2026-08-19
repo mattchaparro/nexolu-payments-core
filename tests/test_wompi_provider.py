@@ -240,6 +240,9 @@ async def test_charge_with_nequi_sends_phone_number_and_has_no_redirect(httpx_mo
     sent_body = json.loads(request.content)
     assert sent_body["payment_method"] == {"type": "NEQUI", "phone_number": "3107654321"}
     assert "customer_data" not in sent_body
+    # Sin redirect_url explicito, no se manda el campo (Wompi no lo exige
+    # para metodos sincronos como Nequi con cobro unico).
+    assert "redirect_url" not in sent_body
     # Nequi no hace polling adicional de redirect_url: si el codigo
     # intentara pollear igual, httpx_mock fallaria por no tener registrada
     # una respuesta para esa URL -- esta asercion es solo un refuerzo extra.
@@ -281,6 +284,7 @@ async def test_charge_with_pse_sends_payer_and_customer_data_and_extracts_redire
             customer_full_name="Cliente De Prueba",
             customer_phone_number="3107654321",
         ),
+        redirect_url="https://app.test/subscription?wompi_paid=1",
     )
 
     assert result.redirect_url == "https://sandbox.wompi.co/pse/redirect"
@@ -291,6 +295,8 @@ async def test_charge_with_pse_sends_payer_and_customer_data_and_extracts_redire
     assert sent_body["payment_method"]["financial_institution_code"] == "1"
     # customer_data va HERMANO de payment_method en el body de Wompi, no anidado.
     assert sent_body["customer_data"] == {"phone_number": "3107654321", "full_name": "Cliente De Prueba"}
+    # Sin esto, Wompi no sabe a donde volver tras el pago en el sitio del banco.
+    assert sent_body["redirect_url"] == "https://app.test/subscription?wompi_paid=1"
 
 
 async def test_charge_with_pse_polls_for_redirect_url_when_not_immediately_available(httpx_mock, monkeypatch):

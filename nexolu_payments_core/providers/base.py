@@ -245,6 +245,7 @@ class PaymentProvider(Protocol):
         customer_email: str,
         credentials: ProviderCredentialsData,
         payment_method: PaymentMethodInput,
+        redirect_url: str | None = None,
     ) -> ChargeResult: ...
 
     async def list_payment_methods(self, *, credentials: ProviderCredentialsData) -> list[str]: ...

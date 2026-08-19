@@ -104,6 +104,13 @@ class Transaction(Base):
     amount_cop: Mapped[int] = mapped_column(Integer)
     currency: Mapped[str] = mapped_column(String(8), default="COP")
     status: Mapped[str] = mapped_column(String(16), default="pending")
+    # Solo lo necesita flow="api" para metodos asincronos (PSE, Boton
+    # Bancolombia): hay que reenviarselo a Wompi al cobrar (POST
+    # /transactions) para que redirija de vuelta a la app cuando el usuario
+    # termina en el sitio del banco - sin esto Wompi no sabe a donde volver.
+    # El flujo Widget no lo necesita (el redirect lo maneja el propio
+    # widget.js client-side), pero se guarda para cualquier flow igual.
+    redirect_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     fee_cop: Mapped[int | None] = mapped_column(Integer, nullable=True)
     net_amount_cop: Mapped[int | None] = mapped_column(Integer, nullable=True)
     customer_email: Mapped[str | None] = mapped_column(String(255), nullable=True)

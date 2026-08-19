@@ -106,6 +106,7 @@ async def create_payment_intent(
         status="pending",
         customer_email=customer.get("email"),
         extra_metadata=metadata,
+        redirect_url=redirect_url,
     )
     session.add(transaction)
     await session.flush()
@@ -144,6 +145,7 @@ async def charge_payment_intent(
             customer_email=transaction.customer_email or "",
             credentials=_credentials_data(credential),
             payment_method=payment_method,
+            redirect_url=transaction.redirect_url,
         )
     except ProviderRequestError:
         transaction.status = "error"
