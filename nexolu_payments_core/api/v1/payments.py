@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import secrets
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
@@ -14,8 +14,18 @@ from nexolu_payments_core.core.memory import repository
 from nexolu_payments_core.core.memory.db import get_session
 from nexolu_payments_core.core.memory.entities import Integration, Merchant, ProviderCredential
 from nexolu_payments_core.core.payments import service
+from nexolu_payments_core.core.payments.service import _EVENT_BY_KIND
 from nexolu_payments_core.core.security.api_keys import generate_secret, hash_api_key
-from nexolu_payments_core.providers.base import BancolombiaTransferPaymentMethod, CardPaymentMethod, NequiPaymentMethod, PaymentMethodInput, PaymentSourceChargeMethod, ProviderRequestError, PsePaymentMethod
+from nexolu_payments_core.core.webhooks.dispatcher import dispatch_transaction_event
+from nexolu_payments_core.providers.base import (
+    BancolombiaTransferPaymentMethod,
+    CardPaymentMethod,
+    NequiPaymentMethod,
+    PaymentMethodInput,
+    PaymentSourceChargeMethod,
+    ProviderRequestError,
+    PsePaymentMethod,
+)
 
 router = APIRouter(prefix="/v1", tags=["payments"])
 provisioning_router = APIRouter(prefix="/admin", tags=["admin"])
@@ -75,7 +85,7 @@ class PaymentSourceChargeMethodIn(BaseModel):
     installments: int = Field(default=1, ge=1)
 
 
-PaymentMethodIn = Annotated[Union[CardPaymentMethodIn, NequiPaymentMethodIn, PsePaymentMethodIn, BancolombiaTransferPaymentMethodIn, PaymentSourceChargeMethodIn], Field(discriminator="type")]
+PaymentMethodIn = Annotated[CardPaymentMethodIn | NequiPaymentMethodIn | PsePaymentMethodIn | BancolombiaTransferPaymentMethodIn | PaymentSourceChargeMethodIn, Field(discriminator="type")]
 
 
 class ChargeIn(BaseModel):
@@ -385,6 +395,100 @@ async def get_wompi_secrets(merchant_id: str, environment: str = "sandbox", x_pa
         "private_key": credential.private_key,
         "integrity_secret": credential.integrity_secret,
         "events_secret": credential.events_secret,
+    }
+
+
+@provisioning_router.get("/transactions", summary="List transactions across all merchants")
+async def list_transactions(
+    merchant_id: str | None = None,
+    status: str | None = None,
+    provider: str | None = None,
+    reference: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    x_payments_provisioning_key: str | None = Header(default=None),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    _require_provisioning_key(x_payments_provisioning_key)
+    rows = await repository.list_transactions(
+        session,
+        merchant_id=merchant_id,
+        status=status,
+        provider_slug=provider,
+        reference=reference,
+        limit=min(limit, 200),
+        offset=offset,
+    )
+    deliveries = await repository.list_webhook_deliveries_by_transaction_ids(session, [t.id for t, *_ in rows])
+    # Ya vienen ordenadas por created_at desc (ver repository) - la primera
+    # que se ve por transaction_id es la mas reciente.
+    latest_delivery_by_transaction: dict[str, Any] = {}
+    for delivery in deliveries:
+        latest_delivery_by_transaction.setdefault(delivery.transaction_id, delivery)
+
+    def _serialize(row: tuple[Any, str, str, str, str]) -> dict[str, Any]:
+        transaction, merchant_name, merchant_slug, integration_name, integration_slug = row
+        delivery = latest_delivery_by_transaction.get(transaction.id)
+        return {
+            "id": transaction.id,
+            "reference": transaction.reference,
+            "merchant_id": transaction.merchant_id,
+            "merchant_name": merchant_name,
+            "merchant_slug": merchant_slug,
+            "integration_id": transaction.integration_id,
+            "integration_name": integration_name,
+            "integration_slug": integration_slug,
+            "provider": transaction.provider_slug,
+            "provider_transaction_id": transaction.provider_transaction_id,
+            "status": transaction.status,
+            "amount_cop": transaction.amount_cop,
+            "currency": transaction.currency,
+            "fee_cop": transaction.fee_cop,
+            "net_amount_cop": transaction.net_amount_cop,
+            "created_at": transaction.created_at,
+            "confirmed_at": transaction.confirmed_at,
+            # webhook_delivered=None: nunca se intento (transaccion todavia
+            # pendiente, no dispara notificacion). False: se intento y
+            # fallo (ver webhook_last_error) - el caso real que motivo esto,
+            # una integration sin webhook_url configurada.
+            "webhook_delivered": delivery.delivered_at is not None if delivery else None,
+            "webhook_last_error": delivery.last_error if delivery else None,
+        }
+
+    return {"transactions": [_serialize(row) for row in rows]}
+
+
+@provisioning_router.post(
+    "/transactions/{transaction_id}/redeliver-webhook",
+    summary="Retry notifying the integration of this transaction's current status",
+)
+async def redeliver_transaction_webhook(
+    transaction_id: str,
+    x_payments_provisioning_key: str | None = Header(default=None),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    # Para cuando la notificacion original nunca llego (ej. la integration
+    # no tenia webhook_url configurada todavia, o el receptor estuvo caido
+    # un rato) - reintenta AHORA con el estado actual de la transaccion, sin
+    # tocar nada de Wompi. No hay cola de reintentos automatica todavia (ver
+    # dispatcher.py), esto es el mecanismo manual mientras tanto.
+    _require_provisioning_key(x_payments_provisioning_key)
+    transaction = await repository.get_transaction_by_id(session, transaction_id)
+    if transaction is None:
+        raise HTTPException(status_code=404, detail="Transaccion no encontrada.")
+    integration = await repository.get_integration_by_id(session, transaction.integration_id)
+    if integration is None:
+        raise HTTPException(status_code=404, detail="La integration de esta transaccion ya no existe.")
+
+    event = _EVENT_BY_KIND.get(transaction.status, "payment.pending")
+    delivery = await dispatch_transaction_event(session, transaction=transaction, integration=integration, event=event)
+    await session.commit()
+    return {
+        "transaction_id": transaction.id,
+        "event": event,
+        "delivered": delivery.delivered_at is not None,
+        "last_status_code": delivery.last_status_code,
+        "last_error": delivery.last_error,
     }
 
 
