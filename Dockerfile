@@ -1,8 +1,12 @@
 # FastAPI + Uvicorn -- mismo patron que nexolu-ia-core y nexolu-comms-api.
+#
+# Sin gcc a proposito: todas las dependencias de pyproject.toml (incluida
+# cryptography, la unica de las 3 apps que tiene componentes en Rust) bajan
+# como wheel precompilado para linux x86_64 - nada se compila desde
+# source. Instalar gcc agregaba ~240MB sin necesidad, verificado en vivo
+# el 2026-08-20 (build identico con/sin gcc, mismo resultado, imagen final
+# 536MB -> 293MB en ia-core).
 FROM python:3.12-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends gcc \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY pyproject.toml ./
