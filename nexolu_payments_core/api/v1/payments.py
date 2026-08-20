@@ -365,4 +365,27 @@ async def get_wompi_status(merchant_id: str, environment: str = "sandbox", x_pay
     return {"provider": "wompi", "environment": environment, "configured": credential is not None, "public_key": credential.public_key if credential else None}
 
 
+@provisioning_router.get("/merchants/{merchant_id}/providers/wompi/secrets", summary="Reveal current Wompi credentials")
+async def get_wompi_secrets(merchant_id: str, environment: str = "sandbox", x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    # A diferencia de get_wompi_status (que solo expone public_key, la
+    # unica que no es secreta), este endpoint dedicado revela
+    # private_key/integrity_secret/events_secret tambien - mismo criterio
+    # que GET .../integrations/{id}/secrets: bajo demanda, detras de un
+    # boton de "revelar" explicito en el panel, no en texto plano por
+    # defecto. Solo lectura, no cambia nada.
+    _require_provisioning_key(x_payments_provisioning_key)
+    credential = await repository.get_active_credential(session, merchant_id, "wompi", environment)
+    if credential is None:
+        raise HTTPException(status_code=404, detail="No hay credenciales de Wompi configuradas para este entorno.")
+    return {
+        "merchant_id": merchant_id,
+        "provider": "wompi",
+        "environment": environment,
+        "public_key": credential.public_key,
+        "private_key": credential.private_key,
+        "integrity_secret": credential.integrity_secret,
+        "events_secret": credential.events_secret,
+    }
+
+
 router.include_router(provisioning_router)

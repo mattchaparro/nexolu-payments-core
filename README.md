@@ -102,9 +102,7 @@ El payload es agnóstico del proveedor e incluye `transaction_id`, `reference`, 
 
 Las credenciales privadas de proveedores se almacenan cifradas mediante Fernet. La clave maestra `PAYMENTS_MASTER_KEY` solo vive en el entorno del servicio.
 
-Nunca se devuelven private keys, integrity secrets o events secrets (credenciales de Wompi) mediante endpoints de consulta - ni Wompi las vuelve a dar una vez configuradas, así que tampoco tendría sentido acá.
-
-`api_key`/`webhook_secret` de una integration son distintos: `GET .../integrations/{id}/secrets` sí los revela bajo demanda (no solo en la respuesta de creación/regeneración) - a pedido del panel de administración, que los muestra ocultos con un botón de "revelar" explícito, nunca en texto plano por defecto. `GET`/`list` de integrations en general siguen sin exponerlos.
+`GET .../providers/wompi` (estado general) solo expone `public_key` - la única que no es secreta. `private_key`/`integrity_secret`/`events_secret` (credenciales de Wompi) y `api_key`/`webhook_secret` (de una integration) siguen el mismo patrón: nunca se exponen en los endpoints generales (`get_wompi_status`, `get_integration`, `list_integrations`), pero sí bajo demanda a través de un endpoint `.../secrets` dedicado (`GET .../providers/wompi/secrets`, `GET .../integrations/{id}/secrets`) - de solo lectura, no cambia nada. Existen porque el panel de administración los muestra ocultos con un botón de "revelar" explícito, nunca en texto plano por defecto - ni Wompi mismo los vuelve a dar una vez configurados, así que sin esto no habría forma de volver a verlos.
 
 ## Desarrollo
 

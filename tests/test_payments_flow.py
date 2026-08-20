@@ -265,6 +265,116 @@ async def test_delete_integration_404_for_unknown_id(client, monkeypatch):
     assert response.status_code == 404
 
 
+async def test_configure_wompi_then_status_reports_configured_with_only_public_key(client, monkeypatch):
+    monkeypatch.setenv("PROVISIONING_KEY", "provisioning-test-key")
+    from nexolu_payments_core.config import get_settings
+    get_settings.cache_clear()
+    headers = {"X-Payments-Provisioning-Key": "provisioning-test-key"}
+
+    merchant = (await client.post("/v1/admin/merchants", headers=headers, json={"name": "Merchant K", "slug": "merchant-k"})).json()
+
+    configured = await client.post(
+        f"/v1/admin/merchants/{merchant['id']}/providers/wompi",
+        headers=headers,
+        json={
+            "environment": "sandbox",
+            "public_key": "pub_test_123",
+            "private_key": "prv_test_123",
+            "integrity_secret": "integ_123",
+            "events_secret": "evt_123",
+        },
+    )
+    assert configured.status_code == 201
+
+    status_response = await client.get(
+        f"/v1/admin/merchants/{merchant['id']}/providers/wompi", headers=headers, params={"environment": "sandbox"}
+    )
+    assert status_response.status_code == 200
+    body = status_response.json()
+    assert body["configured"] is True
+    assert body["public_key"] == "pub_test_123"
+    assert "private_key" not in body
+    assert "integrity_secret" not in body
+    assert "events_secret" not in body
+
+
+async def test_configure_wompi_rejects_duplicate_for_same_environment(client, monkeypatch):
+    monkeypatch.setenv("PROVISIONING_KEY", "provisioning-test-key")
+    from nexolu_payments_core.config import get_settings
+    get_settings.cache_clear()
+    headers = {"X-Payments-Provisioning-Key": "provisioning-test-key"}
+
+    merchant = (await client.post("/v1/admin/merchants", headers=headers, json={"name": "Merchant L", "slug": "merchant-l"})).json()
+    payload = {
+        "environment": "sandbox",
+        "public_key": "pub",
+        "private_key": "prv",
+        "integrity_secret": "integ",
+        "events_secret": "evt",
+    }
+    first = await client.post(f"/v1/admin/merchants/{merchant['id']}/providers/wompi", headers=headers, json=payload)
+    assert first.status_code == 201
+
+    second = await client.post(f"/v1/admin/merchants/{merchant['id']}/providers/wompi", headers=headers, json=payload)
+    assert second.status_code == 409
+
+
+async def test_get_wompi_secrets_reveals_all_four_credentials(client, monkeypatch):
+    monkeypatch.setenv("PROVISIONING_KEY", "provisioning-test-key")
+    from nexolu_payments_core.config import get_settings
+    get_settings.cache_clear()
+    headers = {"X-Payments-Provisioning-Key": "provisioning-test-key"}
+
+    merchant = (await client.post("/v1/admin/merchants", headers=headers, json={"name": "Merchant M", "slug": "merchant-m"})).json()
+    await client.post(
+        f"/v1/admin/merchants/{merchant['id']}/providers/wompi",
+        headers=headers,
+        json={
+            "environment": "sandbox",
+            "public_key": "pub_reveal",
+            "private_key": "prv_reveal",
+            "integrity_secret": "integ_reveal",
+            "events_secret": "evt_reveal",
+        },
+    )
+
+    revealed = await client.get(
+        f"/v1/admin/merchants/{merchant['id']}/providers/wompi/secrets",
+        headers=headers,
+        params={"environment": "sandbox"},
+    )
+    assert revealed.status_code == 200
+    assert revealed.json() == {
+        "merchant_id": merchant["id"],
+        "provider": "wompi",
+        "environment": "sandbox",
+        "public_key": "pub_reveal",
+        "private_key": "prv_reveal",
+        "integrity_secret": "integ_reveal",
+        "events_secret": "evt_reveal",
+    }
+
+
+async def test_get_wompi_secrets_404_when_not_configured(client, monkeypatch):
+    monkeypatch.setenv("PROVISIONING_KEY", "provisioning-test-key")
+    from nexolu_payments_core.config import get_settings
+    get_settings.cache_clear()
+    headers = {"X-Payments-Provisioning-Key": "provisioning-test-key"}
+
+    merchant = (await client.post("/v1/admin/merchants", headers=headers, json={"name": "Merchant N", "slug": "merchant-n"})).json()
+    response = await client.get(
+        f"/v1/admin/merchants/{merchant['id']}/providers/wompi/secrets",
+        headers=headers,
+        params={"environment": "sandbox"},
+    )
+    assert response.status_code == 404
+
+
+async def test_get_wompi_secrets_requires_server_key(client):
+    response = await client.get("/v1/admin/merchants/x/providers/wompi/secrets")
+    assert response.status_code == 401
+
+
 async def test_models_have_merchant_context():
     from nexolu_payments_core.core.memory.entities import Integration, ProviderCredential, Transaction
 
