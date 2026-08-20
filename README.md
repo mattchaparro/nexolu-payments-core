@@ -102,7 +102,9 @@ El payload es agnóstico del proveedor e incluye `transaction_id`, `reference`, 
 
 Las credenciales privadas de proveedores se almacenan cifradas mediante Fernet. La clave maestra `PAYMENTS_MASTER_KEY` solo vive en el entorno del servicio.
 
-Nunca se devuelven private keys, integrity secrets o events secrets mediante endpoints de consulta.
+Nunca se devuelven private keys, integrity secrets o events secrets (credenciales de Wompi) mediante endpoints de consulta - ni Wompi las vuelve a dar una vez configuradas, así que tampoco tendría sentido acá.
+
+`api_key`/`webhook_secret` de una integration son distintos: `GET .../integrations/{id}/secrets` sí los revela bajo demanda (no solo en la respuesta de creación/regeneración) - a pedido del panel de administración, que los muestra ocultos con un botón de "revelar" explícito, nunca en texto plano por defecto. `GET`/`list` de integrations en general siguen sin exponerlos.
 
 ## Desarrollo
 

@@ -163,6 +163,59 @@ async def test_regenerate_integration_secret_requires_server_key(client):
     assert response.status_code == 401
 
 
+async def test_get_integration_secrets_reveals_current_values_without_changing_them(client, monkeypatch):
+    monkeypatch.setenv("PROVISIONING_KEY", "provisioning-test-key")
+    from nexolu_payments_core.config import get_settings
+    get_settings.cache_clear()
+    headers = {"X-Payments-Provisioning-Key": "provisioning-test-key"}
+
+    merchant = (await client.post("/v1/admin/merchants", headers=headers, json={"name": "Merchant I", "slug": "merchant-i"})).json()
+    created = (
+        await client.post(
+            f"/v1/admin/merchants/{merchant['id']}/integrations",
+            headers=headers,
+            json={"name": "App I", "slug": "app-i"},
+        )
+    ).json()
+
+    revealed = await client.get(
+        f"/v1/admin/merchants/{merchant['id']}/integrations/{created['id']}/secrets", headers=headers
+    )
+    assert revealed.status_code == 200
+    body = revealed.json()
+    assert body == {
+        "id": created["id"],
+        "merchant_id": merchant["id"],
+        "api_key": created["api_key"],
+        "webhook_secret": created["webhook_secret"],
+    }
+
+    # A diferencia de regenerate-secret, este endpoint es de solo lectura -
+    # el api_key original sigue autenticando despues de llamarlo.
+    auth_response = await client.get(
+        "/v1/payments/payment-methods", headers={"Authorization": f"Bearer {created['api_key']}"}
+    )
+    assert auth_response.status_code != 401
+
+
+async def test_get_integration_secrets_requires_server_key(client):
+    response = await client.get("/v1/admin/merchants/x/integrations/y/secrets")
+    assert response.status_code == 401
+
+
+async def test_get_integration_secrets_404_for_unknown_id(client, monkeypatch):
+    monkeypatch.setenv("PROVISIONING_KEY", "provisioning-test-key")
+    from nexolu_payments_core.config import get_settings
+    get_settings.cache_clear()
+    headers = {"X-Payments-Provisioning-Key": "provisioning-test-key"}
+
+    merchant = (await client.post("/v1/admin/merchants", headers=headers, json={"name": "Merchant J", "slug": "merchant-j"})).json()
+    response = await client.get(
+        f"/v1/admin/merchants/{merchant['id']}/integrations/no-existe/secrets", headers=headers
+    )
+    assert response.status_code == 404
+
+
 async def test_delete_integration_deactivates_and_blocks_auth(client, monkeypatch):
     monkeypatch.setenv("PROVISIONING_KEY", "provisioning-test-key")
     from nexolu_payments_core.config import get_settings

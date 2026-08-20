@@ -262,14 +262,39 @@ async def list_integrations(merchant_id: str, x_payments_provisioning_key: str |
 
 @provisioning_router.get("/merchants/{merchant_id}/integrations/{integration_id}", summary="Get an integration")
 async def get_integration(merchant_id: str, integration_id: str, x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    # api_key/webhook_secret nunca se re-exponen aca (solo en la respuesta
-    # de create_integration, una unica vez) - mismo criterio que
-    # get_wompi_status con private_key/integrity_secret/events_secret.
+    # api_key/webhook_secret nunca se exponen en este endpoint general -
+    # para eso esta el endpoint dedicado GET .../secrets (mas abajo), que
+    # el panel de administracion usa detras de un boton de "revelar"
+    # explicito. Mismo criterio que get_wompi_status con
+    # private_key/integrity_secret/events_secret (esas si siguen sin
+    # endpoint de reveal, Wompi no las vuelve a dar una vez configuradas).
     _require_provisioning_key(x_payments_provisioning_key)
     integration = await repository.get_integration_by_id(session, integration_id)
     if integration is None or integration.merchant_id != merchant_id:
         raise HTTPException(status_code=404, detail="Integration no encontrada.")
     return {"id": integration.id, "merchant_id": integration.merchant_id, "name": integration.name, "slug": integration.slug, "environment": integration.environment, "webhook_url": integration.webhook_url, "widget_enabled": integration.widget_enabled, "is_active": integration.is_active}
+
+
+@provisioning_router.get(
+    "/merchants/{merchant_id}/integrations/{integration_id}/secrets", summary="Reveal current api_key and webhook_secret"
+)
+async def get_integration_secrets(merchant_id: str, integration_id: str, x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    # A diferencia de get_integration/list_integrations (que NUNCA exponen
+    # api_key/webhook_secret), este endpoint dedicado si los revela - a
+    # pedido explicito del panel de administracion, que los muestra
+    # ocultos con un boton de "revelar" (nunca en texto plano por
+    # defecto). No cambia nada, solo lee - a diferencia de
+    # regenerate-secret, que invalida los viejos.
+    _require_provisioning_key(x_payments_provisioning_key)
+    integration = await repository.get_integration_by_id(session, integration_id)
+    if integration is None or integration.merchant_id != merchant_id:
+        raise HTTPException(status_code=404, detail="Integration no encontrada.")
+    return {
+        "id": integration.id,
+        "merchant_id": integration.merchant_id,
+        "api_key": integration.api_key,
+        "webhook_secret": integration.webhook_secret,
+    }
 
 
 @provisioning_router.patch("/merchants/{merchant_id}/integrations/{integration_id}", summary="Update an integration")
