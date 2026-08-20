@@ -4,7 +4,7 @@ from __future__ import annotations
 import secrets
 from typing import Annotated, Any, Literal, Union
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +14,7 @@ from nexolu_payments_core.core.memory import repository
 from nexolu_payments_core.core.memory.db import get_session
 from nexolu_payments_core.core.memory.entities import Integration, Merchant, ProviderCredential
 from nexolu_payments_core.core.payments import service
+from nexolu_payments_core.core.security.api_keys import generate_secret, hash_api_key
 from nexolu_payments_core.providers.base import BancolombiaTransferPaymentMethod, CardPaymentMethod, NequiPaymentMethod, PaymentMethodInput, PaymentSourceChargeMethod, ProviderRequestError, PsePaymentMethod
 
 router = APIRouter(prefix="/v1", tags=["payments"])
@@ -281,6 +282,40 @@ async def update_integration(merchant_id: str, integration_id: str, body: Integr
         setattr(integration, field, value)
     await session.commit()
     return {"id": integration.id, "merchant_id": integration.merchant_id, "name": integration.name, "slug": integration.slug, "environment": integration.environment, "webhook_url": integration.webhook_url, "widget_enabled": integration.widget_enabled, "is_active": integration.is_active}
+
+
+@provisioning_router.post("/merchants/{merchant_id}/integrations/{integration_id}/regenerate-secret", summary="Regenerate api_key and webhook_secret")
+async def regenerate_integration_secret(merchant_id: str, integration_id: str, x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    # Invalida el api_key/webhook_secret viejos de una - cualquier app
+    # cliente que todavia los tenga guardados empieza a fallar auth de
+    # inmediato (mismo criterio que create_integration: los secretos nuevos
+    # solo se ven una vez, en esta respuesta).
+    _require_provisioning_key(x_payments_provisioning_key)
+    integration = await repository.get_integration_by_id(session, integration_id)
+    if integration is None or integration.merchant_id != merchant_id:
+        raise HTTPException(status_code=404, detail="Integration no encontrada.")
+    new_api_key = generate_secret("nxl")
+    integration.api_key = new_api_key
+    integration.api_key_hash = hash_api_key(new_api_key)
+    integration.webhook_secret = generate_secret("whsec")
+    await session.commit()
+    return {"id": integration.id, "merchant_id": integration.merchant_id, "api_key": integration.api_key, "webhook_secret": integration.webhook_secret}
+
+
+@provisioning_router.delete("/merchants/{merchant_id}/integrations/{integration_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Deactivate an integration")
+async def delete_integration(merchant_id: str, integration_id: str, x_payments_provisioning_key: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> None:
+    # Soft-delete (is_active=False), no DELETE de la fila: una Integration
+    # con transacciones asociadas no se puede borrar de verdad sin romper
+    # la integridad referencial (transactions.integration_id, FK no
+    # nullable) - y aun sin transacciones, preferimos conservar el
+    # historial. La Integration deja de aceptar auth (ver
+    # repository.get_integration_by_api_key, que ya filtra is_active).
+    _require_provisioning_key(x_payments_provisioning_key)
+    integration = await repository.get_integration_by_id(session, integration_id)
+    if integration is None or integration.merchant_id != merchant_id:
+        raise HTTPException(status_code=404, detail="Integration no encontrada.")
+    integration.is_active = False
+    await session.commit()
 
 
 @provisioning_router.post("/merchants/{merchant_id}/providers/wompi", status_code=201, summary="Configure Wompi credentials")

@@ -8,16 +8,12 @@ from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Intege
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from nexolu_payments_core.core.memory.db import Base
-from nexolu_payments_core.core.security.api_keys import hash_api_key
+from nexolu_payments_core.core.security.api_keys import generate_secret, hash_api_key
 from nexolu_payments_core.core.security.crypto import EncryptedString
 
 
 def _uuid() -> str:
     return uuid.uuid4().hex
-
-
-def _secret(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex}{uuid.uuid4().hex[:16]}"
 
 
 class Merchant(Base):
@@ -42,7 +38,7 @@ class Integration(Base):
     api_key: Mapped[str] = mapped_column(EncryptedString(255), nullable=False)
     api_key_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     webhook_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    webhook_secret: Mapped[str] = mapped_column(EncryptedString(255), default=lambda: _secret("whsec"))
+    webhook_secret: Mapped[str] = mapped_column(EncryptedString(255), default=lambda: generate_secret("whsec"))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     # Prende/apaga el flow="widget" (checkout.wompi.co/widget.js embebido)
     # para esta Integration, sin tocar flow="api" (tokenizacion/PSE/Nequi/
@@ -55,7 +51,7 @@ class Integration(Base):
     fee_schedules: Mapped[list[FeeSchedule]] = relationship(back_populates="integration")
 
     def __init__(self, **kwargs):
-        api_key = kwargs.pop("api_key", None) or _secret("nxl")
+        api_key = kwargs.pop("api_key", None) or generate_secret("nxl")
         self.api_key = api_key
         self.api_key_hash = hash_api_key(api_key)
         super().__init__(**kwargs)

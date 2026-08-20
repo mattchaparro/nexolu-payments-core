@@ -119,6 +119,99 @@ async def test_list_and_get_integration_never_expose_api_key(client, monkeypatch
     assert "api_key" not in fetched.json()
 
 
+async def test_regenerate_integration_secret_invalidates_old_api_key(client, monkeypatch):
+    monkeypatch.setenv("PROVISIONING_KEY", "provisioning-test-key")
+    from nexolu_payments_core.config import get_settings
+    get_settings.cache_clear()
+    headers = {"X-Payments-Provisioning-Key": "provisioning-test-key"}
+
+    merchant = (await client.post("/v1/admin/merchants", headers=headers, json={"name": "Merchant F", "slug": "merchant-f"})).json()
+    created = (
+        await client.post(
+            f"/v1/admin/merchants/{merchant['id']}/integrations",
+            headers=headers,
+            json={"name": "App F", "slug": "app-f"},
+        )
+    ).json()
+    old_api_key = created["api_key"]
+
+    regenerated = await client.post(
+        f"/v1/admin/merchants/{merchant['id']}/integrations/{created['id']}/regenerate-secret",
+        headers=headers,
+    )
+    assert regenerated.status_code == 200
+    body = regenerated.json()
+    assert body["api_key"] != old_api_key
+    assert body["webhook_secret"] != created["webhook_secret"]
+
+    # El api_key viejo ya no autentica - fue reemplazado, no agregado.
+    old_key_response = await client.post(
+        "/v1/payments/intents",
+        headers={"Authorization": f"Bearer {old_api_key}"},
+        json={"amount_cop": 1000, "customer": {"email": "a@b.com"}},
+    )
+    assert old_key_response.status_code == 401
+
+    new_key_response = await client.get(
+        "/v1/payments/payment-methods", headers={"Authorization": f"Bearer {body['api_key']}"}
+    )
+    assert new_key_response.status_code != 401
+
+
+async def test_regenerate_integration_secret_requires_server_key(client):
+    response = await client.post("/v1/admin/merchants/x/integrations/y/regenerate-secret")
+    assert response.status_code == 401
+
+
+async def test_delete_integration_deactivates_and_blocks_auth(client, monkeypatch):
+    monkeypatch.setenv("PROVISIONING_KEY", "provisioning-test-key")
+    from nexolu_payments_core.config import get_settings
+    get_settings.cache_clear()
+    headers = {"X-Payments-Provisioning-Key": "provisioning-test-key"}
+
+    merchant = (await client.post("/v1/admin/merchants", headers=headers, json={"name": "Merchant G", "slug": "merchant-g"})).json()
+    created = (
+        await client.post(
+            f"/v1/admin/merchants/{merchant['id']}/integrations",
+            headers=headers,
+            json={"name": "App G", "slug": "app-g"},
+        )
+    ).json()
+
+    deleted = await client.delete(
+        f"/v1/admin/merchants/{merchant['id']}/integrations/{created['id']}", headers=headers
+    )
+    assert deleted.status_code == 204
+
+    fetched = await client.get(
+        f"/v1/admin/merchants/{merchant['id']}/integrations/{created['id']}", headers=headers
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()["is_active"] is False
+
+    # El api_key de una integration desactivada ya no autentica.
+    auth_response = await client.get(
+        "/v1/payments/payment-methods", headers={"Authorization": f"Bearer {created['api_key']}"}
+    )
+    assert auth_response.status_code == 401
+
+
+async def test_delete_integration_requires_server_key(client):
+    response = await client.delete("/v1/admin/merchants/x/integrations/y")
+    assert response.status_code == 401
+
+
+async def test_delete_integration_404_for_unknown_id(client, monkeypatch):
+    monkeypatch.setenv("PROVISIONING_KEY", "provisioning-test-key")
+    from nexolu_payments_core.config import get_settings
+    get_settings.cache_clear()
+    headers = {"X-Payments-Provisioning-Key": "provisioning-test-key"}
+
+    merchant = (await client.post("/v1/admin/merchants", headers=headers, json={"name": "Merchant H", "slug": "merchant-h"})).json()
+    response = await client.delete(f"/v1/admin/merchants/{merchant['id']}/integrations/no-existe", headers=headers)
+    assert response.status_code == 404
+
+
 async def test_models_have_merchant_context():
     from nexolu_payments_core.core.memory.entities import Integration, ProviderCredential, Transaction
 
